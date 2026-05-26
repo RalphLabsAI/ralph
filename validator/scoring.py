@@ -2,6 +2,12 @@
 Scoring — the `score = quality + benchmark + stability - cost - complexity -
 regression` formula from whitepaper §5.5.
 
+The compute-cost denominator carries a credibility factor α from the two-tier
+model (§5.4): α = 1.0 for verified (hardware-attested), α = 0.5 for
+unverified (any GPU). Effective cost = claimed_cost / α, so unverified
+submissions pay a 2× cost penalty — making the lie-about-hardware attack
+unprofitable (calibrated against the H100/4090 price ratio).
+
 For Phase 0 we keep it minimal and tunable: only quality and cost terms are
 implemented; stability, complexity, regression are zero placeholders with
 hooks so we can wire them in once we have multi-seed runs.
@@ -12,6 +18,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+ALPHA_VERIFIED = 1.0
+ALPHA_UNVERIFIED = 0.5
+
+
 @dataclass
 class ScoreReport:
     val_bpb: float
@@ -19,6 +29,9 @@ class ScoreReport:
     quality_gain: float
     benchmark_gain: float
     compute_cost: float
+    compute_cost_effective: float
+    tier: str
+    alpha: float
     score: float
     king_val_bpb: float | None
     king_benchmark: float | None
@@ -53,6 +66,7 @@ def score_bundle(
     noise_floor_margin: float,
     matmul_ms: float,
     wall_clock_s: float,
+    tier: str = "unverified",
     bpb_weight: float = 1.0,
     benchmark_weight: float = 1.0,
     cost_weight: float = 0.1,
@@ -60,19 +74,21 @@ def score_bundle(
     """
     Quality gain on val_bpb is computed as (king - challenger) since lower
     val_bpb is better. Benchmark gain is (challenger - king) since higher
-    accuracy is better. Compute cost is normalized H100-hours.
+    accuracy is better.
 
-    The "decisively beats king" predicate (§5.7) is true if the quality gain
-    exceeds the noise-floor margin on at least one of the metrics, AND no
-    other metric materially regresses.
+    Compute cost = claimed_cost / α where α = 1.0 (verified) or 0.5
+    (unverified). The effective cost for unverified is 2× claimed, so the
+    per-compute-dollar score is halved — making it unprofitable to lie about
+    hardware (§5.4).
     """
+    alpha = ALPHA_VERIFIED if tier == "verified" else ALPHA_UNVERIFIED
+
     if king_val_bpb is None:
-        # First baseline run — no king to beat, returned for noise-floor calibration.
         quality_gain = 0.0
         benchmark_gain = 0.0
         decisively = False
     else:
-        quality_gain = (king_val_bpb - val_bpb)  # positive == improvement
+        quality_gain = (king_val_bpb - val_bpb)
         benchmark_gain = (benchmark_accuracy - (king_benchmark or 0.0))
         decisively = (
             (quality_gain > noise_floor_margin and benchmark_gain >= -noise_floor_margin)
@@ -81,10 +97,12 @@ def score_bundle(
         )
 
     cost_h100h = _hours_to_normalized_h100(matmul_ms, wall_clock_s)
+    cost_effective = cost_h100h / alpha
+
     score = (
         bpb_weight * quality_gain
         + benchmark_weight * benchmark_gain
-        - cost_weight * cost_h100h
+        - cost_weight * cost_effective
     )
 
     return ScoreReport(
@@ -93,6 +111,9 @@ def score_bundle(
         quality_gain=quality_gain,
         benchmark_gain=benchmark_gain,
         compute_cost=cost_h100h,
+        compute_cost_effective=cost_effective,
+        tier=tier,
+        alpha=alpha,
         score=score,
         king_val_bpb=king_val_bpb,
         king_benchmark=king_benchmark,

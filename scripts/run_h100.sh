@@ -31,6 +31,11 @@ DATA_TOKENS="${DATA_TOKENS:-1000000000}"        # 1B training tokens
 EVAL_TOKENS="${EVAL_TOKENS:-5000000}"           # 5M eval tokens
 NOISE_RUNS="${NOISE_RUNS:-10}"
 KARPATHIAN1_SEED="${KARPATHIAN1_SEED:-1337}"
+# Two-tier model (whitepaper v1.1 §5.4):
+#   "verified"   = full TDX+nvtrust attestation chain (needs CC-capable H100)
+#   "unverified" = no attestation, scored at α=0.5 (any H100 works)
+# Default to unverified since most Shadeform rentals aren't CC-capable.
+TIER="${TIER:-unverified}"
 
 echo "=============================================="
 echo "  Karpathian Phase 0.5 — H100 Bootstrap"

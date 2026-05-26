@@ -119,8 +119,10 @@ def op1_diff_and_integrity(
         ("checkpoint", proof_dir / "training" / "checkpoint.pt", manifest["checkpoint_sha256"]),
         ("training_log", proof_dir / "training" / "training_log.jsonl", manifest["training_log_sha256"]),
         ("calibration", proof_dir / "calibration.json", manifest["calibration_sha256"]),
-        ("attestation", proof_dir / "attestation.json", manifest["attestation_sha256"]),
     ]
+    # Attestation is optional (unverified tier has no attestation.json).
+    if manifest.get("attestation_sha256"):
+        pairs.append(("attestation", proof_dir / "attestation.json", manifest["attestation_sha256"]))
     for name, path, expected in pairs:
         if not path.exists():
             return False, f"missing artifact {name} at {path}"
@@ -134,12 +136,21 @@ def op2_attestation_verify(
     karpathian_root: Path,
     submission_payload: dict,
     proof_dir: Path,
-) -> tuple[bool, str]:
-    """Verify the mock attestation chain. In Phase 0.5+ swap in TDX/nvtrust."""
-    att_text = (proof_dir / "attestation.json").read_text()
+) -> tuple[bool, str, str]:
+    """Verify attestation. Returns (ok, detail, tier).
+
+    Tier-aware (whitepaper v1.1 §5.4):
+      - If attestation.json is present and valid → tier = "verified"
+      - If attestation.json is absent → tier = "unverified" (NOT rejected)
+      - If attestation.json is present but INVALID → rejected (moral hazard:
+        a failed verified claim is not silently downgraded to unverified)
+    """
+    att_path = proof_dir / "attestation.json"
+    if not att_path.exists():
+        return True, "no attestation — scoring as unverified (α=0.5)", "unverified"
+
+    att_text = att_path.read_text()
     att = MockAttestation.from_json(att_text)
-    # Re-derive the expected container_measurement from the validator's
-    # local source tree (= what we know the on-chain pinned image hash is).
     expected_measurement = compute_container_measurement(_list_proof_sources(karpathian_root))
     ok, errors = verify_mock_attestation(
         att,
@@ -148,8 +159,8 @@ def op2_attestation_verify(
         expected_bundle_hash=submission_payload["bundle_hash"],
     )
     if not ok:
-        return False, "; ".join(errors)
-    return True, "ok"
+        return False, "verified-tier claim failed: " + "; ".join(errors), "rejected"
+    return True, "attestation verified — scoring as verified (α=1.0)", "verified"
 
 
 def op3_log_plausibility(proof_dir: Path) -> tuple[bool, str]:
@@ -222,8 +233,8 @@ def judge_submission(
         result.rejected = ValidatorReject("op1_diff_integrity", detail)
         return result
 
-    ok, detail = op2_attestation_verify(karpathian_root, submission, proof_dir)
-    result.operations["op2_attestation"] = {"ok": ok, "detail": detail}
+    ok, detail, tier = op2_attestation_verify(karpathian_root, submission, proof_dir)
+    result.operations["op2_attestation"] = {"ok": ok, "detail": detail, "tier": tier}
     if not ok:
         result.rejected = ValidatorReject("op2_attestation", detail)
         return result

@@ -153,6 +153,7 @@ def run_proof_test(
     submission_dir: Path,
     out_dir: Path,
     total_steps_override: int | None = None,
+    tier: str = "verified",
 ) -> ProofTestBundle:
     submission_dir = Path(submission_dir)
     out_dir = Path(out_dir)
@@ -245,18 +246,21 @@ def run_proof_test(
         + file_hash(cal_path).encode()
     )
 
-    # 7. Build the per-epoch attestation records. We bucket the training log
-    #    into epochs (in Phase 0, every 10 training steps -> one "epoch" stand-in).
-    #    The real Docker emits one attestation per Bittensor epoch (72 min).
-    epoch_records = _build_epoch_records(training_log_path, handshake_nonce)
-    attestation = generate_mock_attestation(
-        container_measurement=container_measurement,
-        handshake_nonce=handshake_nonce,
-        epoch_records=epoch_records,
-        bundle_hash=bundle_hash,
-    )
-    att_path = out_dir / "attestation.json"
-    att_path.write_text(attestation.to_json())
+    # 7. Build attestation chain (verified tier) or skip (unverified tier).
+    att_path = None
+    if tier == "verified":
+        epoch_records = _build_epoch_records(training_log_path, handshake_nonce)
+        attestation = generate_mock_attestation(
+            container_measurement=container_measurement,
+            handshake_nonce=handshake_nonce,
+            epoch_records=epoch_records,
+            bundle_hash=bundle_hash,
+        )
+        att_path = out_dir / "attestation.json"
+        att_path.write_text(attestation.to_json())
+        print(f"[proof] tier=verified, attestation written")
+    else:
+        print(f"[proof] tier=unverified, no attestation chain generated")
 
     # 8. Bundle manifest: a single JSON listing every artifact + its hash.
     manifest = {
@@ -265,11 +269,12 @@ def run_proof_test(
         "training_log_sha256": file_hash(training_log_path),
         "calibration_sha256": file_hash(cal_path),
         "final_state_sha256": file_hash(final_state_path),
-        "attestation_sha256": file_hash(att_path),
+        "attestation_sha256": file_hash(att_path) if att_path else None,
         "bundle_hash": bundle_hash,
         "container_measurement": container_measurement,
         "handshake_nonce": handshake_nonce,
         "declared_seed": declared_seed,
+        "tier": tier,
     }
     manifest_path = out_dir / "bundle_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -281,7 +286,7 @@ def run_proof_test(
         training_log_path=training_log_path,
         final_state_path=final_state_path,
         calibration_path=cal_path,
-        attestation_path=att_path,
+        attestation_path=att_path if att_path else Path("/dev/null"),
         bundle_manifest_path=manifest_path,
         bundle_hash=bundle_hash,
     )
@@ -324,6 +329,8 @@ def main() -> None:
     p.add_argument("--submission", type=Path, required=True, help="dir with patch.diff + proof_request.json")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--total-steps", type=int, default=None)
+    p.add_argument("--tier", choices=["verified", "unverified"], default="verified",
+                   help="verified = full attestation chain; unverified = no attestation, α=0.5 scoring discount")
     args = p.parse_args()
 
     bundle = run_proof_test(
@@ -331,6 +338,7 @@ def main() -> None:
         submission_dir=args.submission,
         out_dir=args.out_dir,
         total_steps_override=args.total_steps,
+        tier=args.tier,
     )
     print(f"\n[proof] DONE bundle_hash={bundle.bundle_hash[:16]}...")
     print(f"        attestation: {bundle.attestation_path}")

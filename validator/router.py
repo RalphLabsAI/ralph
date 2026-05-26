@@ -80,6 +80,7 @@ def process_submission(
     king_val_bpb = king["val_bpb"] if king else None
     king_benchmark = king["benchmark_accuracy"] if king else None
 
+    tier = result.operations.get("op2_attestation", {}).get("tier", "unverified")
     score = score_bundle(
         val_bpb=result.hidden_eval.val_bpb,
         benchmark_accuracy=result.hidden_eval.benchmark_accuracy,
@@ -88,6 +89,7 @@ def process_submission(
         noise_floor_margin=noise_floor_margin,
         matmul_ms=result.calibration["matmul_ms"],
         wall_clock_s=result.training_summary["wall_clock_s"],
+        tier=tier,
     )
 
     accepted = score.decisively_beats_king if king else False

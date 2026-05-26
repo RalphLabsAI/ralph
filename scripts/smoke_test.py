@@ -44,6 +44,20 @@ PATCH_RAISE_LR = """\
  }
 """
 
+PATCH_LOWER_WD = """\
+--- a/configs/proxy_cpu_smoke.json
++++ b/configs/proxy_cpu_smoke.json
+@@ -10,7 +10,7 @@
+   "micro_batch_size": 4,
+   "total_steps": 20,
+   "warmup_steps": 5,
+   "max_lr": 0.003,
+-  "min_lr": 0.0003,
++  "min_lr": 0.001,
+   "log_every": 2
+ }
+"""
+
 
 def _reset_state(karpathian_root: Path) -> None:
     """Wipe chain + previous runs for a clean smoke test."""
@@ -60,6 +74,7 @@ def _submit_one(
     patch_text: str,
     seed: int,
     label: str,
+    tier: str = "verified",
 ) -> dict:
     """Run the full miner → proof → validator → router flow for one submission."""
     sub_dir = karpathian_root / "runs/smoke_e2e" / f"sub_{label}"
@@ -79,11 +94,12 @@ def _submit_one(
         "miner_hotkey": miner_hotkey,
     }))
 
-    print(f"\n--- [{label}] miner={miner_hotkey} ---")
+    print(f"\n--- [{label}] miner={miner_hotkey} tier={tier} ---")
     bundle = run_proof_test(
         karpathian_root=karpathian_root,
         submission_dir=sub_dir,
         out_dir=proof_dir,
+        tier=tier,
     )
     assemble_submission(karpathian_root, miner_hotkey, sub_dir, proof_dir)
     return process_submission(karpathian_root, proof_dir, noise_floor_margin=0.05)
@@ -103,19 +119,34 @@ def main() -> None:
     print(f"    val_bpb={res_a['result']['hidden_eval']['val_bpb']:.4f}")
     print(f"    accepted_as_king={res_a['event']['accepted_as_king']}")
 
-    # Miner B submits a patch raising max_lr.
+    # Miner B submits a patch (verified tier).
     res_b = _submit_one(
         karpathian_root,
         "5MinerB_raise_lr",
         PATCH_RAISE_LR,
         seed=43,
-        label="B_raise_lr",
+        label="B_verified",
+        tier="verified",
     )
-    print(f"\n[B] status={res_b['status']}")
+    print(f"\n[B verified] status={res_b['status']}")
     print(f"    val_bpb={res_b['result']['hidden_eval']['val_bpb']:.4f}")
-    print(f"    quality_gain={res_b['event']['quality_gain']:+.4f}")
-    print(f"    decisively_beats_king={res_b['event']['decisively_beats_king']}")
-    print(f"    accepted_as_king={res_b['event']['accepted_as_king']}")
+    print(f"    tier={res_b['score']['tier']} α={res_b['score']['alpha']}")
+    print(f"    score={res_b['score']['score']:.4f}")
+
+    # Miner C submits a different patch (UNVERIFIED tier — no attestation, α=0.5).
+    res_c = _submit_one(
+        karpathian_root,
+        "5MinerC_unverified",
+        PATCH_LOWER_WD,
+        seed=44,
+        label="C_unverified",
+        tier="unverified",
+    )
+    print(f"\n[C unverified] status={res_c['status']}")
+    print(f"    val_bpb={res_c['result']['hidden_eval']['val_bpb']:.4f}")
+    print(f"    tier={res_c['score']['tier']} α={res_c['score']['alpha']}")
+    print(f"    score={res_c['score']['score']:.4f}")
+    print(f"    cost_effective={res_c['score']['compute_cost_effective']:.6f} (2× raw due to α=0.5)")
 
     # Print the chain state.
     king_path = karpathian_root / "chain" / "king.json"
