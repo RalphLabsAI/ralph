@@ -62,6 +62,9 @@ class TrainConfig:
     data_seed: int = 1337
     init_seed: int = 1337
 
+    # Precision
+    use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+
     # Logging
     log_every: int = 10
 
@@ -153,9 +156,15 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     wb_run = _init_wandb(cfg, out_dir, use_wandb)
 
+    use_amp = cfg.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    # GradScaler only needed for fp16 (bf16 has enough dynamic range). Disabled = no-op.
+    scaler = torch.amp.GradScaler(device.type, enabled=False) if device.type == "cuda" else None
+
     n_params = model.num_parameters()
     n_params_no_embed = model.num_parameters(exclude_embeddings=True)
     print(f"[train] device={device} params={n_params:,} (no embeddings: {n_params_no_embed:,})")
+    print(f"[train] precision={'bf16' if use_amp else 'fp32'}")
     print(f"[train] manifest tokens={ds.total_tokens:,} hash={ds.manifest.manifest_hash()[:16]}…")
     print(f"[train] steps={cfg.total_steps} batch={cfg.batch_size} micro={cfg.micro_batch_size} seq={cfg.seq_len}")
     if wb_run:
@@ -176,13 +185,24 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
-            _, loss = model(inp, targets=tgt)
-            (loss / cfg.grad_accum_steps).backward()
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                _, loss = model(inp, targets=tgt)
+            scaled_loss = loss / cfg.grad_accum_steps
+            if scaler:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
+        if scaler:
+            scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
-        optimizer.step()
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         last_loss = step_loss
         elapsed = time.time() - start

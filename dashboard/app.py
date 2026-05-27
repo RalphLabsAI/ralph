@@ -87,6 +87,14 @@ def main():
     st.title("⛰️ Karpathian Live")
     st.caption("Phase 0.5 monitoring dashboard — canonical baseline trajectory, submissions, and network health")
 
+    # Auto-refresh every 10 seconds for live training monitoring.
+    refresh = st.sidebar.selectbox("Auto-refresh", ["Off", "10s", "30s", "60s"], index=1)
+    if refresh != "Off":
+        import time as _time
+        secs = {"10s": 10, "30s": 30, "60s": 60}[refresh]
+        _time.sleep(secs)
+        st.rerun()
+
     karpathian_root = Path(sys.argv[-1]) if len(sys.argv) > 1 and Path(sys.argv[-1]).exists() else Path(".")
 
     # --- Current King ---
@@ -160,9 +168,34 @@ def main():
 
     st.divider()
 
-    # --- Training Loss Curves ---
-    st.subheader("📈 Training Loss Curves")
+    # --- Live Training Progress ---
     runs = find_training_runs(karpathian_root)
+    if runs:
+        latest_name, latest_log = runs[-1]
+        df_latest = load_training_log(latest_log)
+        if df_latest is not None and len(df_latest) > 0:
+            last = df_latest.iloc[-1]
+            has_total = "total_steps" in df_latest.columns
+            total_steps = int(last.get("total_steps", 0)) if has_total else None
+
+            st.subheader(f"🔴 Live: {latest_name}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Step", f"{int(last['step'])}" + (f" / {total_steps}" if total_steps else ""))
+            c2.metric("Loss", f"{last['loss']:.4f}")
+            c3.metric("Tok/s", f"{last.get('tokens_per_sec', 0):,.0f}")
+            c4.metric("Elapsed", f"{last.get('elapsed_s', 0) / 60:.1f} min")
+
+            fig_live = go.Figure()
+            fig_live.add_trace(go.Scatter(x=df_latest["step"], y=df_latest["loss"],
+                                          mode="lines", name="loss", line=dict(color="#ff6b6b")))
+            fig_live.update_layout(xaxis_title="Step", yaxis_title="Loss", height=300,
+                                   margin=dict(t=10, b=30))
+            st.plotly_chart(fig_live, use_container_width=True)
+
+    st.divider()
+
+    # --- All Training Loss Curves ---
+    st.subheader("📈 Training Loss Curves")
     if runs:
         selected = st.multiselect("Select runs", [name for name, _ in runs],
                                   default=[runs[-1][0]] if runs else [])
