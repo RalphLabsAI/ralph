@@ -87,13 +87,8 @@ def main():
     st.title("⛰️ Karpathian Live")
     st.caption("Phase 0.5 monitoring dashboard — canonical baseline trajectory, submissions, and network health")
 
-    # Auto-refresh every 10 seconds for live training monitoring.
+    # Auto-refresh selector (applied at the bottom of the page after all content renders).
     refresh = st.sidebar.selectbox("Auto-refresh", ["Off", "10s", "30s", "60s"], index=1)
-    if refresh != "Off":
-        import time as _time
-        secs = {"10s": 10, "30s": 30, "60s": 60}[refresh]
-        _time.sleep(secs)
-        st.rerun()
 
     karpathian_root = Path(sys.argv[-1]) if len(sys.argv) > 1 and Path(sys.argv[-1]).exists() else Path(".")
 
@@ -210,6 +205,13 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
     else:
         st.caption("No training runs found yet.")
+
+    # Auto-refresh: sleep AFTER all content has rendered, then rerun.
+    if refresh != "Off":
+        import time as _time
+        secs = {"10s": 10, "30s": 30, "60s": 60}[refresh]
+        _time.sleep(secs)
+        st.rerun()
 
 
 if __name__ == "__main__":
