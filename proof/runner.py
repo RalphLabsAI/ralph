@@ -38,10 +38,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from calibration import run_calibration
-from proof.mock_attest import (
-    compute_container_measurement,
-    generate_mock_attestation,
-)
+from proof.mock_attest import compute_container_measurement
+from proof.real_attest import generate_attestation, detect_capabilities
 
 
 def _list_proof_sources(base: Path) -> list[Path]:
@@ -249,8 +247,9 @@ def run_proof_test(
     # 7. Build attestation chain (verified tier) or skip (unverified tier).
     att_path = None
     if tier == "verified":
+        caps = detect_capabilities()
         epoch_records = _build_epoch_records(training_log_path, handshake_nonce)
-        attestation = generate_mock_attestation(
+        attestation = generate_attestation(
             container_measurement=container_measurement,
             handshake_nonce=handshake_nonce,
             epoch_records=epoch_records,
@@ -258,7 +257,8 @@ def run_proof_test(
         )
         att_path = out_dir / "attestation.json"
         att_path.write_text(attestation.to_json())
-        print(f"[proof] tier=verified, attestation written")
+        print(f"[proof] tier=verified, attestation_type={attestation.attestation_type} "
+              f"(tdx={caps['tdx']}, nvcc={caps['nvcc']})")
     else:
         print(f"[proof] tier=unverified, no attestation chain generated")
 

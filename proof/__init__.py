@@ -18,6 +18,12 @@ from .mock_attest import (
     verify_mock_attestation,
     MockAttestation,
 )
+from .real_attest import (
+    RealAttestation,
+    generate_attestation,
+    verify_attestation,
+    detect_capabilities,
+)
 
 __all__ = [
     "run_proof_test",
@@ -25,4 +31,8 @@ __all__ = [
     "generate_mock_attestation",
     "verify_mock_attestation",
     "MockAttestation",
+    "RealAttestation",
+    "generate_attestation",
+    "verify_attestation",
+    "detect_capabilities",
 ]

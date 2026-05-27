@@ -32,6 +32,10 @@ from proof.mock_attest import (
     compute_container_measurement,
     verify_mock_attestation,
 )
+from proof.real_attest import (
+    RealAttestation,
+    verify_attestation as verify_real_attestation,
+)
 from miner.submit import verify_signature, lookup_handshake
 
 
@@ -150,17 +154,37 @@ def op2_attestation_verify(
         return True, "no attestation — scoring as unverified (α=0.5)", "unverified"
 
     att_text = att_path.read_text()
-    att = MockAttestation.from_json(att_text)
+    att_data = json.loads(att_text)
     expected_measurement = compute_container_measurement(_list_proof_sources(karpathian_root))
-    ok, errors = verify_mock_attestation(
-        att,
-        expected_container_measurement=expected_measurement,
-        expected_handshake_nonce=submission_payload["handshake_nonce"],
-        expected_bundle_hash=submission_payload["bundle_hash"],
-    )
+
+    # Auto-detect attestation format: real (has attestation_type field) vs legacy mock
+    if "attestation_type" in att_data:
+        att = RealAttestation.from_json(att_text)
+        ok, errors = verify_real_attestation(
+            att,
+            expected_container_measurement=expected_measurement,
+            expected_handshake_nonce=submission_payload["handshake_nonce"],
+            expected_bundle_hash=submission_payload["bundle_hash"],
+        )
+        att_type_label = att.attestation_type
+        is_real = att_type_label.startswith("real_")
+    else:
+        att = MockAttestation.from_json(att_text)
+        ok, errors = verify_mock_attestation(
+            att,
+            expected_container_measurement=expected_measurement,
+            expected_handshake_nonce=submission_payload["handshake_nonce"],
+            expected_bundle_hash=submission_payload["bundle_hash"],
+        )
+        att_type_label = "mock"
+        is_real = False
+
     if not ok:
-        return False, "verified-tier claim failed: " + "; ".join(errors), "rejected"
-    return True, "attestation verified — scoring as verified (α=1.0)", "verified"
+        return False, f"verified-tier claim failed ({att_type_label}): " + "; ".join(errors), "rejected"
+
+    tier = "verified" if is_real else "verified"  # mock attestation also counts as verified in Phase 0
+    detail = f"attestation verified ({att_type_label}) — scoring as verified (α=1.0)"
+    return True, detail, tier
 
 
 def op3_log_plausibility(proof_dir: Path) -> tuple[bool, str]:

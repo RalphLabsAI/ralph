@@ -1,0 +1,478 @@
+"""
+Real hardware attestation — TDX (CPU) + nvtrust (GPU).
+
+Replaces mock_attest.py when running on a CC-capable H100 with Intel TDX.
+Falls back to mock gracefully when the hardware or libraries aren't available.
+
+Miner side (evidence generation):
+    - NVIDIA nv-attestation-sdk: GPU attestation quote via nvtrust
+    - Intel TDX: CPU attestation quote via /dev/tdx-guest or trustauthority SDK
+
+Validator side (verification):
+    - NVIDIA NRAS (Remote Attestation Service) or local GPU verifier
+    - Intel Trust Authority or local TDX quote verification
+    - Both produce signed JWTs that can be verified offline with cached root certs
+
+Wire format matches mock_attest.py's RealAttestation dataclass so the
+validator's verification path is a clean swap.
+
+Dependencies (optional — graceful fallback when not installed):
+    pip install nv-attestation-sdk  # NVIDIA GPU attestation
+    # Intel TDX tools installed via system packages on TDX-capable hosts
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ============================================================================
+# Data structures — same shape as mock_attest.py for validator compatibility
+# ============================================================================
+
+@dataclass
+class AttestationEpoch:
+    epoch: int
+    timestamp: float
+    rolling_log_hash: str
+    nonce: str
+    container_measurement: str
+    # Real attestation fields (None when using mock)
+    gpu_evidence: Optional[str] = None
+    gpu_token: Optional[str] = None
+    tdx_quote: Optional[str] = None
+    tdx_token: Optional[str] = None
+    # Mock fallback
+    mock_signature: Optional[str] = None
+    attestation_type: str = "mock"  # "real" | "mock"
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+
+@dataclass
+class RealAttestation:
+    container_measurement: str
+    handshake_nonce: str
+    attestation_type: str  # "real_tdx_nvcc" | "real_nvcc_only" | "mock"
+    epochs: list[AttestationEpoch] = field(default_factory=list)
+    bundle_hash: Optional[str] = None
+    gpu_name: Optional[str] = None
+    tdx_available: bool = False
+    nvcc_available: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "container_measurement": self.container_measurement,
+            "handshake_nonce": self.handshake_nonce,
+            "attestation_type": self.attestation_type,
+            "epochs": [e.to_dict() for e in self.epochs],
+            "bundle_hash": self.bundle_hash,
+            "gpu_name": self.gpu_name,
+            "tdx_available": self.tdx_available,
+            "nvcc_available": self.nvcc_available,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> "RealAttestation":
+        d = json.loads(text)
+        epochs = [AttestationEpoch(**e) for e in d.pop("epochs", [])]
+        att = cls(epochs=epochs, **d)
+        return att
+
+
+# ============================================================================
+# Hardware detection
+# ============================================================================
+
+def detect_tdx() -> bool:
+    """Check if Intel TDX is available (running inside a TD guest)."""
+    return os.path.exists("/dev/tdx-guest") or os.path.exists("/dev/tdx_guest")
+
+
+def detect_nvcc() -> bool:
+    """Check if NVIDIA Confidential Computing SDK is available."""
+    try:
+        from nv_attestation_sdk import attestation
+        return True
+    except ImportError:
+        return False
+
+
+def detect_capabilities() -> dict:
+    """Detect what attestation capabilities are available on this machine."""
+    tdx = detect_tdx()
+    nvcc = detect_nvcc()
+    gpu_name = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return {
+        "tdx": tdx,
+        "nvcc": nvcc,
+        "gpu_name": gpu_name,
+        "attestation_type": (
+            "real_tdx_nvcc" if (tdx and nvcc)
+            else "real_nvcc_only" if nvcc
+            else "mock"
+        ),
+    }
+
+
+# ============================================================================
+# Evidence generation (miner side — runs inside the CVM)
+# ============================================================================
+
+def _get_gpu_evidence(nonce: str) -> tuple[Optional[str], Optional[str]]:
+    """Generate NVIDIA GPU attestation evidence + verify via NRAS.
+
+    Returns (evidence_hex, jwt_token) or (None, None) if unavailable.
+    """
+    try:
+        from nv_attestation_sdk import attestation
+
+        client = attestation.Attestation()
+        client.set_nonce(nonce)
+        client.add_verifier(
+            attestation.Devices.GPU,
+            attestation.Environment.REMOTE,
+            "https://nras.attestation.nvidia.com/v4/attest/gpu",
+            "",
+        )
+        evidence_list = client.get_evidence()
+        if not evidence_list:
+            return None, None
+        evidence_hex = evidence_list[0].hex() if isinstance(evidence_list[0], bytes) else str(evidence_list[0])
+        client.attest(evidence_list)
+        token = client.get_token()
+        return evidence_hex, token
+    except Exception as e:
+        print(f"[attest] GPU evidence generation failed: {e}")
+        return None, None
+
+
+def _get_tdx_quote(nonce: str, user_data: str) -> tuple[Optional[str], Optional[str]]:
+    """Generate Intel TDX attestation quote.
+
+    The quote's report_data field carries hash(nonce || user_data) so the
+    validator can verify the quote is bound to this specific submission.
+
+    Returns (quote_hex, verification_token) or (None, None) if unavailable.
+    """
+    if not detect_tdx():
+        return None, None
+
+    report_data = hashlib.sha256((nonce + user_data).encode()).digest()
+
+    try:
+        # Method 1: Direct /dev/tdx-guest ioctl (Linux kernel TDX guest driver)
+        tdx_dev = "/dev/tdx-guest" if os.path.exists("/dev/tdx-guest") else "/dev/tdx_guest"
+        # The tdx-guest device expects a specific ioctl; for now we use the
+        # configfs-tsm interface which is more portable across kernel versions.
+        tsm_path = "/sys/kernel/config/tsm/report/karpathian"
+        os.makedirs(tsm_path, exist_ok=True)
+        with open(f"{tsm_path}/inblob", "wb") as f:
+            f.write(report_data[:64].ljust(64, b"\0"))
+        with open(f"{tsm_path}/outblob", "rb") as f:
+            quote_bytes = f.read()
+        quote_hex = quote_bytes.hex()
+        # Cleanup
+        try:
+            os.rmdir(tsm_path)
+        except Exception:
+            pass
+        return quote_hex, None  # No JWT for local TDX; validator verifies the raw quote
+    except Exception as e:
+        print(f"[attest] TDX quote generation failed: {e}")
+
+    try:
+        # Method 2: Intel Trust Authority client (if installed)
+        result = subprocess.run(
+            ["trustauthority-cli", "quote", "--nonce", nonce, "--user-data", user_data[:64]],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip(), None
+    except Exception as e:
+        print(f"[attest] trustauthority-cli failed: {e}")
+
+    return None, None
+
+
+# ============================================================================
+# Attestation chain generation (called by proof runner)
+# ============================================================================
+
+def generate_attestation(
+    container_measurement: str,
+    handshake_nonce: str,
+    epoch_records: list[tuple[int, float, str]],
+    bundle_hash: str,
+) -> RealAttestation:
+    """Generate a real or mock attestation chain depending on hardware capabilities.
+
+    Args:
+        container_measurement: hash of the proof-test container/source
+        handshake_nonce: validator-issued nonce committed on-chain
+        epoch_records: list of (epoch_idx, timestamp, rolling_log_hash) tuples
+        bundle_hash: hash of the full submission bundle
+    """
+    caps = detect_capabilities()
+    att_type = caps["attestation_type"]
+
+    att = RealAttestation(
+        container_measurement=container_measurement,
+        handshake_nonce=handshake_nonce,
+        attestation_type=att_type,
+        gpu_name=caps["gpu_name"],
+        tdx_available=caps["tdx"],
+        nvcc_available=caps["nvcc"],
+        bundle_hash=bundle_hash,
+    )
+
+    for (epoch_idx, ts, rolling_hash) in epoch_records:
+        user_data = f"{container_measurement}:{rolling_hash}:{handshake_nonce}"
+        epoch = AttestationEpoch(
+            epoch=epoch_idx,
+            timestamp=ts,
+            rolling_log_hash=rolling_hash,
+            nonce=handshake_nonce,
+            container_measurement=container_measurement,
+            attestation_type=att_type,
+        )
+
+        if caps["nvcc"]:
+            gpu_ev, gpu_tok = _get_gpu_evidence(handshake_nonce)
+            epoch.gpu_evidence = gpu_ev
+            epoch.gpu_token = gpu_tok
+
+        if caps["tdx"]:
+            tdx_q, tdx_t = _get_tdx_quote(handshake_nonce, user_data)
+            epoch.tdx_quote = tdx_q
+            epoch.tdx_token = tdx_t
+
+        if att_type == "mock":
+            from .mock_attest import _sign
+            payload = {
+                "epoch": epoch_idx, "timestamp": ts,
+                "rolling_log_hash": rolling_hash,
+                "nonce": handshake_nonce,
+                "container_measurement": container_measurement,
+            }
+            epoch.mock_signature = _sign(payload, container_measurement)
+
+        att.epochs.append(epoch)
+
+    # Final epoch incorporating bundle_hash
+    if epoch_records:
+        last_ts = epoch_records[-1][1] + 1.0
+        last_epoch = epoch_records[-1][0] + 1
+        last_rolling = hashlib.sha256(
+            (epoch_records[-1][2] + bundle_hash).encode()
+        ).hexdigest()
+    else:
+        last_ts = time.time()
+        last_epoch = 0
+        last_rolling = hashlib.sha256(bundle_hash.encode()).hexdigest()
+
+    final_user_data = f"{container_measurement}:{last_rolling}:{handshake_nonce}:{bundle_hash}"
+    final_epoch = AttestationEpoch(
+        epoch=last_epoch,
+        timestamp=last_ts,
+        rolling_log_hash=last_rolling,
+        nonce=handshake_nonce,
+        container_measurement=container_measurement,
+        attestation_type=att_type,
+    )
+
+    if caps["nvcc"]:
+        gpu_ev, gpu_tok = _get_gpu_evidence(handshake_nonce)
+        final_epoch.gpu_evidence = gpu_ev
+        final_epoch.gpu_token = gpu_tok
+
+    if caps["tdx"]:
+        tdx_q, tdx_t = _get_tdx_quote(handshake_nonce, final_user_data)
+        final_epoch.tdx_quote = tdx_q
+        final_epoch.tdx_token = tdx_t
+
+    if att_type == "mock":
+        from .mock_attest import _sign
+        payload = {
+            "epoch": last_epoch, "timestamp": last_ts,
+            "rolling_log_hash": last_rolling,
+            "nonce": handshake_nonce,
+            "container_measurement": container_measurement,
+        }
+        final_epoch.mock_signature = _sign(payload, container_measurement)
+
+    att.epochs.append(final_epoch)
+    return att
+
+
+# ============================================================================
+# Verification (validator side)
+# ============================================================================
+
+def verify_gpu_token(token: str, expected_nonce: str) -> tuple[bool, str]:
+    """Verify an NVIDIA GPU attestation JWT token.
+
+    In production, this verifies the JWT signature against NVIDIA's root
+    certificates and checks the nonce claim matches. For now we accept
+    any non-empty token from the SDK as valid (the SDK itself verified
+    against NRAS during generation).
+    """
+    if not token:
+        return False, "empty GPU token"
+    try:
+        import jwt
+        # NVIDIA NRAS tokens are JWTs signed with RS256.
+        # In production: verify against NVIDIA's JWKS endpoint.
+        # For Phase 0.5c: decode without verification to check claims.
+        claims = jwt.decode(token, options={"verify_signature": False})
+        token_nonce = claims.get("nonce", claims.get("eat_nonce", ""))
+        if expected_nonce and token_nonce != expected_nonce:
+            return False, f"nonce mismatch in GPU token (expected {expected_nonce[:16]}, got {token_nonce[:16]})"
+        return True, "GPU token valid"
+    except ImportError:
+        # No JWT library — accept the token's existence as sufficient for now.
+        return True, "GPU token present (JWT verification skipped — install PyJWT)"
+    except Exception as e:
+        return False, f"GPU token verification failed: {e}"
+
+
+def verify_tdx_quote(quote_hex: str, expected_nonce: str, expected_measurement: str) -> tuple[bool, str]:
+    """Verify an Intel TDX quote.
+
+    In production, this checks:
+      1. Quote signature chains to Intel's root
+      2. RTMR values match expected container measurement
+      3. Report data includes the expected nonce
+
+    For Phase 0.5c: we check the quote is non-empty and well-formed.
+    Full verification requires Intel Trust Authority or local verification libs.
+    """
+    if not quote_hex:
+        return False, "empty TDX quote"
+    try:
+        quote_bytes = bytes.fromhex(quote_hex)
+        if len(quote_bytes) < 256:
+            return False, f"TDX quote too short ({len(quote_bytes)} bytes)"
+        return True, f"TDX quote present ({len(quote_bytes)} bytes, full verification requires Intel TA)"
+    except Exception as e:
+        return False, f"TDX quote verification failed: {e}"
+
+
+def verify_attestation(
+    att: RealAttestation,
+    expected_container_measurement: str,
+    expected_handshake_nonce: str,
+    expected_bundle_hash: str,
+) -> tuple[bool, list[str]]:
+    """Verify an attestation chain (real or mock).
+
+    Dispatches to the appropriate verification path based on attestation_type.
+    """
+    errors: list[str] = []
+
+    if att.container_measurement != expected_container_measurement:
+        errors.append(f"container measurement mismatch")
+    if att.handshake_nonce != expected_handshake_nonce:
+        errors.append("handshake nonce mismatch")
+    if att.bundle_hash != expected_bundle_hash:
+        errors.append("bundle hash mismatch")
+    if not att.epochs:
+        errors.append("no attestation epochs")
+        return False, errors
+
+    if att.attestation_type == "mock":
+        from .mock_attest import MockAttestation, verify_mock_attestation
+        mock = MockAttestation(
+            container_measurement=att.container_measurement,
+            handshake_nonce=att.handshake_nonce,
+            bundle_hash=att.bundle_hash,
+        )
+        from .mock_attest import MockAttestationEpoch
+        for ep in att.epochs:
+            mock.epochs.append(MockAttestationEpoch(
+                epoch=ep.epoch, timestamp=ep.timestamp,
+                rolling_log_hash=ep.rolling_log_hash,
+                nonce=ep.nonce, container_measurement=ep.container_measurement,
+                signature=ep.mock_signature or "",
+            ))
+        ok, mock_errors = verify_mock_attestation(
+            mock, expected_container_measurement,
+            expected_handshake_nonce, expected_bundle_hash,
+        )
+        if not ok:
+            errors.extend(mock_errors)
+        return len(errors) == 0, errors
+
+    # Real attestation verification
+    for i, ep in enumerate(att.epochs):
+        if ep.nonce != att.handshake_nonce:
+            errors.append(f"epoch {i}: nonce drift")
+        if ep.container_measurement != att.container_measurement:
+            errors.append(f"epoch {i}: container measurement drift")
+
+        if ep.gpu_token:
+            ok, detail = verify_gpu_token(ep.gpu_token, expected_handshake_nonce)
+            if not ok:
+                errors.append(f"epoch {i}: {detail}")
+
+        if ep.tdx_quote:
+            ok, detail = verify_tdx_quote(
+                ep.tdx_quote, expected_handshake_nonce,
+                expected_container_measurement,
+            )
+            if not ok:
+                errors.append(f"epoch {i}: {detail}")
+
+    # Check final epoch includes bundle hash in rolling hash
+    final = att.epochs[-1]
+    if len(att.epochs) >= 2:
+        prior = att.epochs[-2].rolling_log_hash
+        expected_final = hashlib.sha256((prior + expected_bundle_hash).encode()).hexdigest()
+        if expected_final != final.rolling_log_hash:
+            errors.append("final epoch rolling hash does not include bundle hash")
+    else:
+        expected_final = hashlib.sha256(expected_bundle_hash.encode()).hexdigest()
+        if expected_final != final.rolling_log_hash:
+            errors.append("final epoch rolling hash does not match bundle hash")
+
+    return len(errors) == 0, errors
+
+
+# ============================================================================
+# CLI for manual testing
+# ============================================================================
+
+if __name__ == "__main__":
+    caps = detect_capabilities()
+    print("Hardware capabilities:")
+    print(json.dumps(caps, indent=2))
+    print()
+    if caps["attestation_type"] != "mock":
+        print("Generating a test attestation...")
+        att = generate_attestation(
+            container_measurement="test_measurement_" + "0" * 48,
+            handshake_nonce="test_nonce_" + "0" * 48,
+            epoch_records=[(0, time.time(), "test_rolling_hash")],
+            bundle_hash="test_bundle_hash",
+        )
+        print(att.to_json())
+    else:
+        print("No CC hardware detected — would use mock attestation.")
+        print("Run on a CC-capable H100 with TDX to generate real attestation.")
