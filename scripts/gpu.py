@@ -99,17 +99,29 @@ def cmd_rent(args):
         print(f"Delete it first with: python scripts/gpu.py delete")
         return
 
-    print("Finding cheapest available H100...")
+    # Default: Hyperstack H100. Override with --cloud / --region.
+    preferred_cloud = args.cloud or "hyperstack"
+    preferred_region = args.region or None
+
+    print(f"Finding H100 on {preferred_cloud}...")
     resp = _api("GET", "/instances/types?gpu_type=H100&available=true&sort=price&num_gpus=1")
     types = resp.get("instance_types", [])
-    if not types:
+
+    # Filter for preferred cloud first, fall back to cheapest if unavailable.
+    matches = [t for t in types if t["cloud"] == preferred_cloud]
+    if not matches:
+        print(f"  {preferred_cloud} not available, falling back to cheapest...")
+        matches = types
+    if not matches:
         print("No H100 instances available. Try again later.")
         return
 
-    best = types[0]
+    best = matches[0]
     regions = [a for a in best.get("availability", []) if a.get("available")]
+    if preferred_region:
+        regions = [a for a in regions if a["region"] == preferred_region] or regions
     if not regions:
-        print("No available regions for cheapest type. Try next.")
+        print("No available regions. Try again later.")
         return
 
     cloud = best["cloud"]
@@ -266,7 +278,9 @@ def main():
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("list-types", help="List available H100 instances")
-    sub.add_parser("rent", help="Rent cheapest H100")
+    rent_p = sub.add_parser("rent", help="Rent H100 (default: Hyperstack)")
+    rent_p.add_argument("--cloud", default=None, help="Cloud provider (default: hyperstack)")
+    rent_p.add_argument("--region", default=None, help="Region (default: auto-pick cheapest)")
     sub.add_parser("status", help="Show instance status")
 
     ssh_p = sub.add_parser("ssh", help="SSH into instance")
