@@ -1,55 +1,135 @@
-# Karpathian — Phase 0 MVP
+# Karpathian
 
-This is the Phase 0 closed-testnet implementation of Karpathian — a Bittensor
-subnet for decentralized, autonomous AI research. See the whitepaper at
-`../Karpathian-Whitepaper.docx` (v1.0) for design.
+A Bittensor subnet for decentralized, autonomous AI research. An open,
+continuously improving training recipe — and the public knowledge corpus
+behind it — built by an autonomous research network on Bittensor.
 
-Phase 0 is a **local end-to-end simulation**: no real chain, no real TEE
-attestation. Mock attestation is a signed JSON blob standing in for what
-TDX+nvtrust will sign in Phase 0.5. The goal is to prove the architecture
-end-to-end and measure empirical numbers (noise floor, audit-rate, score
-variance) before committing them to v1.x.
+📄 [Whitepaper (v1.1)](https://github.com/KarpathianBase/karpathian) · 🏷️ [Latest release](https://github.com/KarpathianBase/karpathian/releases)
+
+## What Karpathian produces
+
+1. **A canonical training recipe** — a Git repo containing the best-known open recipe for each track (model class × objective). Anyone can clone it and train a model with state-of-the-art settings.
+2. **A public experiment-record corpus** — every submission the network has ever processed, including verified negative results. Searchable, citable, openly licensed.
+3. **A demonstration model lineage** — Karpathian-1, -2, … — open-weights reference models proving the recipe works and the improvement compounds.
+
+The subnet and its token fund the production of these artifacts. They are not the deliverable.
+
+## Current status
+
+| Phase | Status | Key results |
+|---|---|---|
+| **0 — MVP** | ✅ Complete | End-to-end protocol on CPU: model, training, eval, proof-test, validator, scoring, king-change cycle |
+| **0.5 — H100** | ✅ Complete ([`v0.5.0`](https://github.com/KarpathianBase/karpathian/releases/tag/v0.5.0)) | Real data (1B tokens FineWeb-Edu), noise floor measured (2σ = 0.013 val_bpb), Karpathian-1 trained (254M params, loss 3.82) |
+| **0.5b — Optimization** | 🔜 Next | bf16 mixed precision (~2× throughput), wandb live monitoring |
+| **0.5c — Attestation** | Planned | Real TDX + nvtrust on CC-capable H100 |
+| **0.5d — Testnet** | Planned | Bittensor testnet integration |
+| **1 — Launch** | Planned | Register subnet, open to external miners, first bounty pilot |
+
+## Architecture (three layers)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 1 — Miner's private search                   │
+│  Any agent, any LLM, any GPU, any training code.    │
+│  The protocol doesn't see this.                     │
+└──────────────────────┬──────────────────────────────┘
+                       │ candidate patch
+┌──────────────────────▼──────────────────────────────┐
+│  Layer 2 — Canonical proof test                     │
+│  Official Karpathian Docker on miner's GPU.         │
+│  Applies patch to canonical recipe, trains under    │
+│  fixed (seed, data, config), produces checkpoint +  │
+│  training log + calibration + attestation chain.    │
+└──────────────────────┬──────────────────────────────┘
+                       │ proof bundle
+┌──────────────────────▼──────────────────────────────┐
+│  Layer 3 — Submission + judgment                    │
+│  PR to canonical recipe repo + proof bundle on HF.  │
+│  Validator: diff scan → attestation verify →        │
+│  log plausibility → hidden eval → score.            │
+│  If it decisively beats the king → merge.           │
+└─────────────────────────────────────────────────────┘
+```
 
 ## Directory layout
 
 | Path | What | Patchable by miners? |
 |---|---|---|
-| `model/` | Karpathian-base — minimal Llama-style transformer | Yes (part of the recipe) |
-| `recipe/` | Canonical training code: train loop, data loading, schedule, optimizer config | Yes |
-| `data/` | Tokenizer, data manifest, dataset loader (manifest is content-addressed) | Yes |
-| `configs/` | Training configs per proof-test variant (proxy / confirmation / scale) | Yes |
-| `eval/` | Hidden-eval harness, val_bpb computation, benchmark mix | **No — restricted** |
-| `calibration/` | Deterministic compute benchmark (matmul + attention + collective) | **No — restricted** |
-| `miner/` | Miner-side tooling: search agent (autoresearch-style), submission bundle assembler | Outside protocol |
-| `validator/` | Validator client: four cheap operations + hidden-eval inference + scoring | Outside recipe |
-| `proof/` | Proof-test runner — the future Karpathian Docker. Phase 0 = Python entry-point with mock attestation | Outside recipe |
-| `scripts/` | Utilities: noise-floor calibration, end-to-end smoke test | Outside recipe |
-| `tests/` | Unit tests | — |
+| `model/` | Karpathian-base — Llama-style transformer (RMSNorm, RoPE, SwiGLU, MHA) | Yes |
+| `recipe/` | Canonical training loop, optimizer config, LR schedule | Yes |
+| `data/` | Tokenizer, data manifest, dataset loader | Yes |
+| `configs/` | Training configs: `proxy` (125M), `default` (254M), `scale` (913M) | Yes |
+| `eval/` | Hidden-eval harness, val_bpb, benchmark mix | **Restricted** |
+| `calibration/` | Deterministic compute benchmark (matmul + attention) | **Restricted** |
+| `proof/` | Proof-test runner (future: Docker container) | **Restricted** |
+| `miner/` | Submission bundle assembly, HuggingFace upload, hotkey signing | Outside protocol |
+| `validator/` | Four cheap ops + scoring + Stage 5 audit | Outside recipe |
+| `dashboard/` | Karpathian Live — Streamlit monitoring dashboard | — |
+| `scripts/` | `run_h100.sh` bootstrap, `noise_floor.py`, `smoke_test.py` | — |
 
-The split between **patchable** (recipe) and **restricted** (eval, calibration)
-is enforced by `restricted_files.yaml` and the diff-scanner in `validator/`.
+## Quick start
 
-## Phase 0 workflow
+### CPU smoke test (no GPU needed)
 
-1. Miner's private search loop (any agent, any hardware): generates a candidate
-   patch against the canonical recipe.
-2. Miner runs `proof/proof_runner.py` with the patch — applies it to a clean
-   checkout, runs canonical training under fixed seed/data, emits checkpoint +
-   training log + calibration result + mock attestation.
-3. Miner runs `miner/submit.py` to assemble the submission bundle and sign with
-   a stub hotkey.
-4. Submission router picks up the bundle, distributes to validator instances.
-5. Validator runs `validator/validator.py`: diff scan, mock-attestation verify,
-   log plausibility, hidden-eval inference, score.
-6. If accepted, the patch is merged into the canonical recipe.
+```bash
+git clone https://github.com/KarpathianBase/karpathian.git
+cd karpathian
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch numpy tiktoken cryptography
 
-## Phase 0.5 — what comes next (not in this repo yet)
+# Generate synthetic data
+python -m data.prepare --source synthetic --out data/shards \
+    --shard-tokens 50000 --total-tokens 200000 --eval-tokens 10000
 
-- Replace mock attestation with real TDX + nvtrust on a CC-capable cloud H100.
-- Build the proof-test runner into a reproducibly-built signed Docker image.
-- Integrate Bittensor SDK for on-chain commitments and weight setting.
-- Move from local JSON-file "chain" to Bittensor testnet.
+# Run end-to-end: two miners submit, validator scores, king changes
+python scripts/smoke_test.py
+```
 
-## Status
+### H100 full run (real data)
 
-Phase 0 build in progress. See top-level TODOs.
+```bash
+git clone https://github.com/KarpathianBase/karpathian.git
+cd karpathian
+bash scripts/run_h100.sh
+```
+
+This bootstraps everything on a fresh H100: FineWeb-Edu data prep (1B tokens),
+calibration benchmark, noise floor (10 seeds), and Karpathian-1 training
+(254M params, ~262M tokens). Wall-clock: ~6-7 hours (fp32).
+
+### Live monitoring
+
+```bash
+# wandb (real-time loss curves during training)
+python -m recipe.train --config configs/h100_default.json --out-dir runs/my_run --wandb
+
+# Streamlit dashboard (network status, king history, submissions)
+pip install 'karpathian[dashboard]'
+streamlit run dashboard/app.py
+```
+
+## Two-tier credibility model
+
+| Tier | Requirements | Scoring |
+|---|---|---|
+| **Verified** (α=1.0) | Official Docker in CC-CVM (H100/H200/B200 + TDX/SEV-SNP) | Compute claim at face value |
+| **Unverified** (α=0.5) | Official Docker on any GPU | Effective cost = 2× claimed (0.5× credibility discount) |
+
+The 0.5× discount is calibrated against the H100/4090 price ratio (~5-10×) so
+lying about hardware is unprofitable. As Confidential Computing commoditizes,
+the unverified tier is expected to be deprecated.
+
+## Phase 0.5 measured results
+
+| Metric | Value |
+|---|---|
+| H100 calibration (matmul) | 0.512 ms |
+| Noise floor (10 seeds, 125M model) | σ = 0.006 val_bpb, margin (2σ) = 0.013 |
+| Karpathian-1 (254M params, 262M tokens) | Final loss = 3.82 |
+
+Full results: [`docs/phase_0_5_results.md`](docs/phase_0_5_results.md) ·
+Release: [`v0.5.0`](https://github.com/KarpathianBase/karpathian/releases/tag/v0.5.0)
+
+## License
+
+Apache-2.0

@@ -3,7 +3,7 @@
 **Date:** May 26, 2026
 **Hardware:** NVIDIA H100 PCIe 80GB (Shadeform / ShadeCloud)
 **Data:** 1B tokens from FineWeb-Edu (sample-10BT), GPT-2 BPE tokenizer
-**Code:** [`KarpathianBase/karpathian`](https://github.com/KarpathianBase/karpathian) @ `main`
+**Code:** [`KarpathianBase/karpathian`](https://github.com/KarpathianBase/karpathian/tree/v0.5.0) @ [`v0.5.0`](https://github.com/KarpathianBase/karpathian/releases/tag/v0.5.0)
 
 ---
 
@@ -153,4 +153,5 @@ Requires an H100 GPU. The script handles everything: venv, dependencies, data pr
 ---
 
 🔗 **Repo:** [github.com/KarpathianBase/karpathian](https://github.com/KarpathianBase/karpathian)
+🏷️ **This milestone:** [`v0.5.0`](https://github.com/KarpathianBase/karpathian/releases/tag/v0.5.0) — exact code snapshot for this phase
 📄 **Whitepaper:** v1.1 (available in repo)
