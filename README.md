@@ -23,7 +23,9 @@ The subnet and its token fund the production of these artifacts. They are not th
 | **0.5b — Optimization** | 🔜 Next | bf16 mixed precision (~2× throughput), wandb live monitoring |
 | **0.5c — Attestation** | Planned | Real TDX + nvtrust on CC-capable H100 |
 | **0.5d — Testnet** | Planned | Bittensor testnet integration |
-| **1 — Launch** | Planned | Register subnet, open to external miners, first bounty pilot |
+| **1.0 — Launch** | Planned | Register subnet, open to external miners, first bounty pilot |
+| **1.1 — SDK** | Planned | `pip install karpathian` on PyPI, CI/CD, changelog, semver |
+| **1.2 — Docs** | Planned | Documentation site, miner/validator quickstart guides, corpus query tutorials |
 
 ## Architecture (three layers)
 
