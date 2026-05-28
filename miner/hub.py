@@ -21,7 +21,7 @@ Usage:
     # Validator downloads for scoring
     python -m miner.hub download --bundle-hash abc123 --repo karpaai/proof-bundles --out-dir /tmp/bundle
 
-Requires: pip install 'karpa[hub]'
+Requires: pip install 'karpa-subnet[hub]'
 """
 
 from __future__ import annotations

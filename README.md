@@ -24,7 +24,7 @@ The subnet and its token fund the production of these artifacts. They are not th
 | **0.5c — Attestation** | ✅ Code-complete | Real TDX + nvtrust attestation module: auto-detects CC hardware, falls back to mock. Untested on real CC (needs Azure NCC / GCP A3-Confidential) |
 | **0.5d — Testnet** | ✅ Complete ([`v0.6.0`](https://github.com/karpaai/karpa/releases/tag/v0.6.0)) | Bittensor testnet (netuid 16): two miners competed, validator set weights on-chain, king changed. Chain abstraction layer with rate-limit handling. |
 | **1.0 — Launch** | Planned | Register subnet, open to external miners, first bounty pilot |
-| **1.1 — SDK** | Planned | `pip install karpa` on PyPI, CI/CD, changelog, semver |
+| **1.1 — SDK** | Planned | `pip install karpa-subnet` on PyPI, CI/CD, changelog, semver |
 | **1.2 — Docs** | Planned | Documentation site, miner/validator quickstart guides, corpus query tutorials |
 
 ## Architecture (three layers)
@@ -38,7 +38,7 @@ The subnet and its token fund the production of these artifacts. They are not th
                        │ candidate patch
 ┌──────────────────────▼──────────────────────────────┐
 │  Layer 2 — Canonical proof test                     │
-│  Official Karpa Docker on miner's GPU.         │
+│  Official Karpa Docker on miner's GPU.              │
 │  Applies patch to canonical recipe, trains under    │
 │  fixed (seed, data, config), produces checkpoint +  │
 │  training log + calibration + attestation chain.    │
@@ -106,7 +106,7 @@ calibration benchmark, noise floor (10 seeds), and Karpa-1 training
 python -m recipe.train --config configs/h100_default.json --out-dir runs/my_run --wandb
 
 # Streamlit dashboard (network status, king history, submissions)
-pip install 'karpa[dashboard]'
+pip install 'karpa-subnet[dashboard]'
 streamlit run dashboard/app.py
 ```
 

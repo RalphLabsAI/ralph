@@ -9,7 +9,7 @@ Reads from the local chain state + run outputs and displays:
   - Calibration reference timings
 
 Usage:
-    pip install 'karpa[dashboard]'
+    pip install 'karpa-subnet[dashboard]'
     streamlit run dashboard/app.py -- --karpa-root /path/to/karpa
 
 Phase 0.5: reads local JSON files. Phase 1+: reads from Bittensor chain +

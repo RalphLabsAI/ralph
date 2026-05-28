@@ -15,7 +15,7 @@ This will:
   3. Write a held-out eval shard to eval/private/active_tokens.bin for val_bpb.
   4. Build content-addressed manifest at data/data_manifest.json.
 
-Requires `datasets` package: pip install 'karpa[data]'
+Requires `datasets` package: pip install 'karpa-subnet[data]'
 """
 
 from __future__ import annotations
