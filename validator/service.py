@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chain_layer.config import get_chain
 from validator.validator import judge_submission
 from validator.scoring import score_bundle
+from validator.hf_poller import poll_hub, DEFAULT_REPO as DEFAULT_HF_REPO
 
 # Bittensor's bt.logging hijacks Python's logging module and raises the root
 # level to WARNING, silencing our INFO messages. Use direct prints with
@@ -154,8 +155,19 @@ def run_epoch(
     chain,
     queue_dir: Path,
     noise_floor_margin: float,
+    hf_repo: str | None = None,
+    hf_token: str | None = None,
+    hf_limit: int = 10,
 ) -> dict:
     """Process all pending submissions in one epoch."""
+    if hf_repo:
+        try:
+            new = poll_hub(queue_dir, repo_id=hf_repo, token=hf_token, limit=hf_limit)
+            if new:
+                log_info(f"pulled {len(new)} bundle(s) from HF Hub: {[b[:8] for b in new]}")
+        except Exception as e:
+            log_warn(f"HF Hub poll failed: {e}")
+
     bundles = poll_queue(queue_dir)
     if not bundles:
         return {"submissions": 0, "accepted": 0, "rejected": 0}
@@ -253,6 +265,12 @@ def main():
                    help="Seconds between epochs (default: 120, ~10 blocks)")
     p.add_argument("--noise-floor", type=float, default=0.013,
                    help="val_bpb margin for 'decisively beats king' (default: 0.013 from H100 calibration)")
+    p.add_argument("--hf-repo", default=os.environ.get("AUTORALPH_HF_REPO", DEFAULT_HF_REPO),
+                   help=f"HuggingFace dataset repo to poll (default: {DEFAULT_HF_REPO}). Set to empty string to disable.")
+    p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"),
+                   help="HuggingFace API token (defaults to $HF_TOKEN)")
+    p.add_argument("--hf-limit", type=int, default=10,
+                   help="Max bundles to download per epoch (default: 10)")
     p.add_argument("--once", action="store_true", help="Run one epoch then exit")
     args = p.parse_args()
 
@@ -273,6 +291,10 @@ def main():
     log_info(f"queue: {args.queue_dir}")
     log_info(f"epoch interval: {args.epoch_seconds}s")
     log_info(f"noise floor margin: {args.noise_floor}")
+    if args.hf_repo:
+        log_info(f"HF Hub poll: {args.hf_repo} (limit {args.hf_limit}/epoch)")
+    else:
+        log_info("HF Hub poll: disabled")
     log_info(f"submit bundles to: {args.queue_dir / 'pending' / '<bundle_id>/'}")
     log_info("")
 
@@ -282,7 +304,14 @@ def main():
         log_info(f"--- epoch {epoch} ---")
 
         try:
-            result = run_epoch(chain, args.queue_dir, args.noise_floor)
+            result = run_epoch(
+                chain,
+                args.queue_dir,
+                args.noise_floor,
+                hf_repo=args.hf_repo or None,
+                hf_token=args.hf_token,
+                hf_limit=args.hf_limit,
+            )
             if result["submissions"] > 0:
                 log_info(f"epoch {epoch}: {result['submissions']} submissions, "
                          f"{result['accepted']} accepted, {result['rejected']} rejected")

@@ -54,6 +54,12 @@ chain/
 # Run outputs: training logs, checkpoints, calibration results, proof bundles.
 runs/
 
+# Validator queue (local pending/scored/rejected bundles + HF poller state).
+queue/
+
+# Service logs (validator, miner, etc.).
+logs/
+
 # Test submission staging dirs.
 submissions/
 
