@@ -67,6 +67,22 @@ def log_debug(msg: str) -> None:
     if os.environ.get("KARPA_DEBUG"):
         print(f"{_ts()} [DEBUG] {msg}", flush=True)
 
+
+# Three-class submission classification — see RUN_PLAN_meaningful_failure.md.
+# A submission that passes all four cheap ops is then sorted into one of:
+#   - king_change       weight 1.0   (decisively beats king past noise floor)
+#   - meaningful_failure weight 0.1  (informative dead-end: attested + non-
+#                                     trivial diff + coherent rationale +
+#                                     val_bpb within 2x the noise band)
+#   - plain_failure     weight 0.0   (didn't beat king and uninformative)
+KING_CHANGE_WEIGHT = 1.0
+MEANINGFUL_FAILURE_WEIGHT = 0.1
+PLAIN_FAILURE_WEIGHT = 0.0
+NOISE_FLOOR_MARGIN_2X_MULTIPLIER = 2.0
+RATIONALE_MIN_NON_WS_CHARS = 200
+RATIONALE_MIN_PARAGRAPHS = 2
+DIFF_MIN_CHANGED_LINES = 5
+
 KARPA_ROOT = Path(__file__).resolve().parent.parent
 SHUTDOWN = False
 
@@ -120,6 +136,103 @@ def _verify_pr_if_required(result, bundle_dir: Path) -> tuple[bool, str]:
     return v.ok, v.detail
 
 
+def _diff_is_nontrivial(patch_path: Path) -> bool:
+    """A diff is non-trivial if it changes more than DIFF_MIN_CHANGED_LINES
+    non-whitespace, non-comment lines AND at least one of the touched files
+    looks like it actually affects training (under recipe/, training/, or
+    a *.yaml / *.yml config)."""
+    if not patch_path.exists():
+        return False
+    try:
+        text = patch_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    changed = 0
+    touches_training = False
+    for line in text.splitlines():
+        if line.startswith("diff --git ") or line.startswith("+++ ") or line.startswith("--- "):
+            ll = line.lower()
+            if any(t in ll for t in ("recipe/", "training", "/optim", ".yaml", ".yml")):
+                touches_training = True
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            stripped = line[1:].strip()
+            if stripped and not stripped.startswith("#"):
+                changed += 1
+    return changed > DIFF_MIN_CHANGED_LINES and touches_training
+
+
+def _rationale_is_coherent(rationale_path: Path) -> bool:
+    """Heuristic: rationale.md is coherent if it has at least
+    RATIONALE_MIN_NON_WS_CHARS non-whitespace chars, at least
+    RATIONALE_MIN_PARAGRAPHS non-empty paragraphs, and at least 4 distinct
+    sentences (catches template / boilerplate / pure repetition).
+
+    First cut is structural heuristic only; an LLM-judge pass is a documented
+    followup — see RUN_PLAN_meaningful_failure.md."""
+    if not rationale_path.exists():
+        return False
+    try:
+        text = rationale_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    non_ws = "".join(text.split())
+    if len(non_ws) < RATIONALE_MIN_NON_WS_CHARS:
+        return False
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(paragraphs) < RATIONALE_MIN_PARAGRAPHS:
+        return False
+    sentences = [s.strip() for s in text.replace("\n", " ").split(".") if len(s.strip()) > 10]
+    if len(sentences) < 4:
+        return False
+    if len(set(sentences)) < len(sentences) * 0.6:
+        return False
+    return True
+
+
+def _classify_outcome(
+    *,
+    decisively: bool,
+    val_bpb: float,
+    king_bpb: float | None,
+    noise_floor_margin: float,
+    bundle_dir: Path,
+) -> tuple[str, float]:
+    """Classify a submission that has already passed all four cheap ops.
+
+    Returns (classification, weight_credit) — one of:
+      - ("king_change",        KING_CHANGE_WEIGHT)        — beats king past noise floor
+      - ("meaningful_failure", MEANINGFUL_FAILURE_WEIGHT) — didn't beat king, but
+            attested + non-trivial diff + coherent rationale + val_bpb landed
+            within 2x the 2sigma noise band. Rationale ships to the corpus.
+      - ("plain_failure",      PLAIN_FAILURE_WEIGHT)      — anything else
+    """
+    if decisively:
+        return "king_change", KING_CHANGE_WEIGHT
+
+    if king_bpb is None:
+        # No king yet — meaningful_failure is only definable vs an existing king.
+        return "plain_failure", PLAIN_FAILURE_WEIGHT
+
+    # Bar 1: val_bpb must land within 2x the noise band.
+    # delta > 0 means challenger is worse than king. Inside-noise-band cases
+    # (delta <= noise_floor_margin in either direction) are still candidates.
+    delta = val_bpb - king_bpb
+    if delta > NOISE_FLOOR_MARGIN_2X_MULTIPLIER * noise_floor_margin:
+        return "plain_failure", PLAIN_FAILURE_WEIGHT
+
+    # Bar 2: the diff has to change a training-relevant file with more than
+    # DIFF_MIN_CHANGED_LINES non-trivial lines (not whitespace, not comments).
+    if not _diff_is_nontrivial(bundle_dir / "patch.diff"):
+        return "plain_failure", PLAIN_FAILURE_WEIGHT
+
+    # Bar 3: rationale must be present and structurally coherent.
+    if not _rationale_is_coherent(bundle_dir / "rationale.md"):
+        return "plain_failure", PLAIN_FAILURE_WEIGHT
+
+    return "meaningful_failure", MEANINGFUL_FAILURE_WEIGHT
+
+
 def score_and_decide(
     chain,
     bundle_dir: Path,
@@ -166,10 +279,27 @@ def score_and_decide(
     )
 
     is_first = king is None
-    accepted = score.decisively_beats_king or is_first
+    decisively = score.decisively_beats_king or is_first
+
+    classification, weight_credit = _classify_outcome(
+        decisively=decisively,
+        val_bpb=result.hidden_eval.val_bpb,
+        king_bpb=king_bpb,
+        noise_floor_margin=noise_floor_margin,
+        bundle_dir=bundle_dir,
+    )
+    accepted = classification == "king_change"
+    if classification == "king_change":
+        status = "accepted"
+    elif classification == "meaningful_failure":
+        status = "meaningful_failure"
+    else:
+        status = "below_threshold"
 
     return {
-        "status": "accepted" if accepted else "below_threshold",
+        "status": status,
+        "classification": classification,
+        "weight_credit": weight_credit,
         "miner_hotkey": result.miner_hotkey,
         "miner_github": result.miner_github,
         "pr_url": result.pr_url,
@@ -245,7 +375,8 @@ def run_epoch(
             continue
 
         miner_hotkey = result["miner_hotkey"]
-        round_scores[miner_hotkey] = max(round_scores.get(miner_hotkey, 0), result["score"])
+        weight_credit = result.get("weight_credit", 0.0)
+        round_scores[miner_hotkey] = max(round_scores.get(miner_hotkey, 0), weight_credit)
 
         chain.append_event({
             "type": "submission_scored",
@@ -255,10 +386,39 @@ def run_epoch(
             "val_bpb": result["val_bpb"],
             "quality_gain": result["quality_gain"],
             "score": result["score"],
+            "weight_credit": weight_credit,
+            "classification": result.get("classification", "unknown"),
             "tier": result["tier"],
             "decisive": result["decisive"],
             "accepted": result["accepted"],
         })
+
+        # Meaningful-failure branch: didn't crown a new king, but the work was
+        # informative. Give 10% weight credit and archive the rationale as a
+        # published negative result (HF push is a documented followup; for
+        # now, local archive to queue/meaningful_failure/<bundle_id>/).
+        if result["status"] == "meaningful_failure":
+            gh = result.get("miner_github", "")
+            who = f"{gh} ({miner_hotkey[:12]}...)" if gh else f"{miner_hotkey[:20]}..."
+            king_now = chain.get_king()
+            king_bpb_str = f"{king_now.val_bpb:.4f}" if king_now else "—"
+            log_info(
+                f"MEANINGFUL FAILURE: {who} val_bpb={result['val_bpb']:.4f} "
+                f"(king {king_bpb_str}); weight={MEANINGFUL_FAILURE_WEIGHT}, "
+                f"rationale archived to corpus"
+            )
+            archive_bundle(bundle_dir, queue_dir, "meaningful_failure")
+            epoch_results.setdefault("meaningful_failures", 0)
+            epoch_results["meaningful_failures"] += 1
+            chain.append_event({
+                "type": "meaningful_failure_archived",
+                "timestamp": time.time(),
+                "miner_hotkey": miner_hotkey,
+                "miner_github": result.get("miner_github", ""),
+                "val_bpb": result["val_bpb"],
+                "bundle_hash": result["bundle_hash"],
+            })
+            continue
 
         if result["accepted"]:
             gh = result.get("miner_github", "")
@@ -482,8 +642,10 @@ def main():
                 hf_limit=args.hf_limit,
             )
             if result["submissions"] > 0:
+                mf = result.get("meaningful_failures", 0)
+                mf_str = f", {mf} meaningful failures" if mf else ""
                 log_info(f"epoch {epoch}: {result['submissions']} submissions, "
-                         f"{result['accepted']} accepted, {result['rejected']} rejected")
+                         f"{result['accepted']} accepted, {result['rejected']} rejected{mf_str}")
             else:
                 log_info(f"epoch {epoch}: no pending submissions")
         except Exception as e:
