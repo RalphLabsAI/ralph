@@ -1,0 +1,91 @@
+"""Single shared source-of-truth for container_measurement source files.
+
+Imported by BOTH the miner-side proof runner and the validator. The two MUST
+walk the same files in the same order or container_measurement diverges
+across hosts and every honest verified-tier submission gets rejected at op2.
+
+See deep_review_2026-05-31: critical #10/#11.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+
+# Files/extensions that contribute to the container_measurement.
+# Keep tight: anything that affects training output must be here; nothing that
+# varies per host (timestamps, lockfiles, secrets) should be.
+_CONTRIBUTING_EXTS = {".py", ".yaml", ".yml", ".json", ".md"}
+_RECIPE_DIRS = ("model", "recipe", "data", "configs")
+_PROTOCOL_DIRS = ("eval", "calibration", "proof")
+_PROTOCOL_FILES = ("restricted_files.yaml", "README.md")
+
+
+def list_proof_sources(
+    karpa_root: Path,
+    recipe_dir: Path | None = None,
+) -> list[tuple[Path, Path]]:
+    """Return a sorted list of (base, relative_path) tuples that contribute to
+    the container_measurement.
+
+    Sorted by repo + POSIX-relative path so the order is canonical regardless
+    of filesystem layout.
+
+    Args:
+        karpa_root: the protocol repo root.
+        recipe_dir: the recipe repo root. If None, expects the recipe dirs to
+            live under karpa_root (legacy single-repo layout).
+    """
+    karpa_root = Path(karpa_root).resolve()
+    pairs: list[tuple[Path, Path]] = []
+
+    if recipe_dir is not None:
+        recipe_dir = Path(recipe_dir).resolve()
+        bases: Iterable[tuple[Path, tuple[str, ...]]] = (
+            (recipe_dir, _RECIPE_DIRS),
+            (karpa_root, _PROTOCOL_DIRS),
+        )
+    else:
+        bases = ((karpa_root, _RECIPE_DIRS + _PROTOCOL_DIRS),)
+
+    for base, dirs in bases:
+        for d in dirs:
+            root = base / d
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if "__pycache__" in p.parts:
+                    continue
+                if p.suffix not in _CONTRIBUTING_EXTS:
+                    continue
+                pairs.append((base, p.relative_to(base)))
+
+    for fname in _PROTOCOL_FILES:
+        fp = karpa_root / fname
+        if fp.exists():
+            pairs.append((karpa_root, Path(fname)))
+
+    # Canonical ordering: by POSIX relative path, ignoring which base it came from.
+    pairs.sort(key=lambda x: x[1].as_posix())
+    return pairs
+
+
+def compute_container_measurement(
+    karpa_root: Path,
+    recipe_dir: Path | None = None,
+) -> str:
+    """Compute the container_measurement: a hash over the canonical source tree.
+
+    Hashes repo-relative POSIX paths (not absolute paths). Two checkouts of the
+    same content at different filesystem locations produce the same digest.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for base, rel in list_proof_sources(karpa_root, recipe_dir):
+        h.update(rel.as_posix().encode("utf-8"))
+        h.update(b"\x00")
+        h.update((base / rel).read_bytes())
+    return h.hexdigest()

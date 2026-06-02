@@ -17,13 +17,29 @@ from .interface import ChainInterface
 
 def _load_dotenv(karpa_root: Path | None = None) -> None:
     """Load .env file into os.environ if it exists. Does not override
-    existing env vars (explicit exports take precedence)."""
+    existing env vars (explicit exports take precedence).
+
+    Warns loudly if the .env file has group/other read permissions — the
+    file contains tokens and wallet passwords; mode 0644 is a security
+    hazard on shared hosts."""
     candidates = []
     if karpa_root:
         candidates.append(Path(karpa_root) / ".env")
     candidates.append(Path.cwd() / ".env")
     for env_path in candidates:
         if env_path.exists():
+            try:
+                mode = env_path.stat().st_mode & 0o777
+                if mode & 0o077:
+                    import sys as _sys
+                    print(
+                        f"[chain] WARNING: {env_path} is mode {oct(mode)} — "
+                        f"contains secrets but is readable by group/other. "
+                        f"Run: chmod 600 {env_path}",
+                        file=_sys.stderr,
+                    )
+            except OSError:
+                pass
             for line in env_path.read_text().splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

@@ -29,14 +29,29 @@ from eval import run_hidden_eval, HiddenEvalResult
 from model import KarpaBase, KarpaConfig
 from proof.mock_attest import (
     MockAttestation,
-    compute_container_measurement,
     verify_mock_attestation,
 )
 from proof.real_attest import (
     RealAttestation,
     verify_attestation as verify_real_attestation,
 )
+from proof.sources import compute_container_measurement
+from proof.runner import scan_diff_for_restricted, _load_restricted_paths
 from miner.submit import verify_signature, lookup_handshake
+
+
+# Hard-coded sanity bounds for the miner-submitted model config. The validator
+# loads checkpoint['config'] from an attacker-controlled file; without bounds
+# a malicious config could OOM the host or allocate gigabytes of memory before
+# the actual RCE prevention (weights_only=True) gets a chance. These bounds
+# are 10x the largest legitimate config we ship today (h100_scale.json).
+MAX_VOCAB_SIZE = 200_000
+MAX_DIM = 8192
+MAX_N_LAYERS = 64
+MAX_N_HEADS = 64
+MAX_HEAD_DIM = 256
+MAX_MAX_SEQ_LEN = 8192
+MAX_CHECKPOINT_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB
 
 
 @dataclass
@@ -77,24 +92,76 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _list_proof_sources(base: Path) -> list[Path]:
-    """Same set as proof/runner.py's _list_proof_sources — must match for
-    the container_measurement to be reproducible across miner+validator."""
-    dirs = ["model", "recipe", "data", "eval", "calibration", "proof"]
-    files = ["restricted_files.yaml", "README.md"]
-    out: list[Path] = []
-    for d in dirs:
-        path = base / d
-        if not path.exists():
-            continue
-        for p in sorted(path.rglob("*")):
-            if p.is_file() and "__pycache__" not in p.parts and p.suffix in {".py", ".yaml", ".json", ".md"}:
-                out.append(p)
-    for f in files:
-        path = base / f
-        if path.exists():
-            out.append(path)
-    return out
+def _safe_load_checkpoint_config(ckpt_path: Path) -> dict:
+    """Load checkpoint['config'] safely.
+
+    We need the config (vocab_size, dim, n_layers, ...) to instantiate the
+    model BEFORE loading state_dict. The legacy on-disk format stores config
+    inside the checkpoint pickle, which means loading the config exposes us
+    to the same pickle-RCE we're trying to avoid.
+
+    Strategy:
+      1. Prefer a sibling `checkpoint_config.json` (new format, JSON-only).
+      2. Fall back to weights_only=True + extra unpickler patches.
+      3. Reject if both fail.
+
+    Bounds-check every field before returning — the values are then passed to
+    KarpaConfig which allocates tensors proportional to them.
+    """
+    sidecar = ckpt_path.parent / "checkpoint_config.json"
+    if sidecar.exists():
+        cfg = json.loads(sidecar.read_text())
+    else:
+        # Legacy path: extract config from the pickle. We use weights_only=True
+        # which since PyTorch 2.4 raises on any arbitrary class reducer, but
+        # still permits primitives. The "config" key is plain dict-of-prims so
+        # this works for honest miners; malicious pickles raise.
+        try:
+            ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(
+                f"checkpoint config could not be loaded safely: {e}. "
+                f"Miner must ship checkpoint_config.json alongside checkpoint.pt."
+            )
+        cfg = ckpt.get("config", {})
+        if not isinstance(cfg, dict):
+            raise RuntimeError("checkpoint['config'] is not a dict")
+    bounds = [
+        ("vocab_size", MAX_VOCAB_SIZE),
+        ("dim", MAX_DIM),
+        ("n_layers", MAX_N_LAYERS),
+        ("n_heads", MAX_N_HEADS),
+        ("head_dim", MAX_HEAD_DIM),
+        ("max_seq_len", MAX_MAX_SEQ_LEN),
+    ]
+    for key, ceiling in bounds:
+        v = cfg.get(key)
+        if not isinstance(v, int) or v <= 0 or v > ceiling:
+            raise RuntimeError(f"checkpoint config {key}={v!r} out of bounds (max {ceiling})")
+    ffn_mult = cfg.get("ffn_mult", 8 / 3)
+    if not isinstance(ffn_mult, (int, float)) or not (0.1 <= float(ffn_mult) <= 32.0):
+        raise RuntimeError(f"checkpoint config ffn_mult={ffn_mult!r} out of bounds")
+    return cfg
+
+
+def _safe_load_checkpoint_weights(ckpt_path: Path, expected_keys: set[str] | None = None) -> dict:
+    """Load checkpoint['model'] state_dict via weights_only=True.
+
+    The size cap is checked BEFORE torch.load to bound memory and prevent
+    20GB checkpoint DoS. weights_only=True (PyTorch 2.4+) rejects any
+    non-tensor / non-primitive payload so a malicious pickle can't fire a
+    reducer.
+    """
+    size = ckpt_path.stat().st_size
+    if size > MAX_CHECKPOINT_BYTES:
+        raise RuntimeError(f"checkpoint too large: {size} bytes (max {MAX_CHECKPOINT_BYTES})")
+    ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+    state_dict = ckpt.get("model", ckpt if isinstance(ckpt, dict) and "model" not in ckpt else None)
+    if state_dict is None:
+        raise RuntimeError("checkpoint has no 'model' state_dict")
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"checkpoint['model'] is not a dict: {type(state_dict).__name__}")
+    return state_dict
 
 
 def op1_diff_and_integrity(
@@ -224,19 +291,22 @@ def op4_hidden_eval(
     proof_dir: Path,
 ) -> tuple[bool, str, HiddenEvalResult | None]:
     ckpt_path = proof_dir / "training" / "checkpoint.pt"
-    ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu")
-    saved = ckpt["config"]
+    if not ckpt_path.exists():
+        return False, f"missing checkpoint at {ckpt_path}", None
+    # Load config + weights using the SAFE path — no pickle reducers, bounds-checked.
+    saved = _safe_load_checkpoint_config(ckpt_path)
+    state_dict = _safe_load_checkpoint_weights(ckpt_path)
     cfg = KarpaConfig(
         vocab_size=saved["vocab_size"],
         dim=saved["dim"],
         n_layers=saved["n_layers"],
         n_heads=saved["n_heads"],
         head_dim=saved["head_dim"],
-        ffn_mult=saved["ffn_mult"],
+        ffn_mult=saved.get("ffn_mult", 8 / 3),
         max_seq_len=saved["max_seq_len"],
     )
     model = KarpaBase(cfg)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(state_dict)
     if torch.cuda.is_available():
         model = model.cuda()
     result = run_hidden_eval(model, karpa_root / "eval" / "private", seq_len=cfg.max_seq_len // 2)

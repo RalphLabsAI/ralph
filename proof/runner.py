@@ -38,35 +38,92 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from calibration import run_calibration
-from proof.mock_attest import compute_container_measurement
 from proof.real_attest import generate_attestation, detect_capabilities
+from proof.sources import compute_container_measurement
+
+
+# Allowlist of env vars the patched training subprocess is permitted to see.
+# Miners control recipe/train.py via patch.diff, so anything inherited by the
+# training subprocess can be exfiltrated through the training_log (which gets
+# published) or a network call. Keep this tight; reject everything else.
+# See deep_review_2026-05-31 critical #2.
+_TRAINING_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TMPDIR", "TEMP", "TMP",
+    # GPU / CUDA
+    "CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_PATH", "CUDA_DEVICE_ORDER",
+    "NVIDIA_VISIBLE_DEVICES", "LD_LIBRARY_PATH",
+    # Torch perf knobs (read-only — can't exfil)
+    "TORCH_USE_CUDA_DSA", "TORCH_CUDA_ARCH_LIST", "PYTORCH_CUDA_ALLOC_CONF",
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+    # HF cache locations (NOT tokens — tokens scrubbed below)
+    "HF_HOME", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE",
+    # wandb run-mode toggle, NOT api key (api key handled below)
+    "WANDB_MODE", "WANDB_DIR",
+)
+# Env vars that must be SCRUBBED even if a downstream library would otherwise
+# read them. These are the secrets the miner subprocess must never see.
+_TRAINING_ENV_BLOCKLIST = (
+    "BT_WALLET_PASSWORD", "BT_WALLET", "BT_HOTKEY",
+    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HUB_TOKEN",
+    "KARPA_BOT_GH_TOKEN", "KARPA_BOT_HF_TOKEN",
+    "SHADEFORM_API_KEY", "WANDB_API_KEY",
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN",
+    "GCP_SERVICE_ACCOUNT_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+    "GH_TOKEN", "GITHUB_TOKEN",
+)
+
+
+def _sanitized_env(extra: dict | None = None) -> dict:
+    """Build an env for the training subprocess: allowlist-only + extras."""
+    import os as _os
+    out = {}
+    for k in _TRAINING_ENV_ALLOWLIST:
+        v = _os.environ.get(k)
+        if v is not None:
+            out[k] = v
+    # Defense-in-depth: pop blocklist explicitly even if allowlist matched.
+    for k in _TRAINING_ENV_BLOCKLIST:
+        out.pop(k, None)
+    if extra:
+        for k, v in extra.items():
+            if k in _TRAINING_ENV_BLOCKLIST:
+                raise ValueError(f"refusing to inject blocklisted env var into training subprocess: {k}")
+            out[k] = v
+    return out
+
+
+# Token-redaction set for subprocess stderr/stdout in error paths. Populated
+# lazily — secrets read once at first redaction call so we don't keep them in
+# module scope longer than needed.
+_REDACT_CACHE: tuple[str, ...] | None = None
+
+
+def _redacted(text: str) -> str:
+    """Scrub known secret values from text before logging / re-raising."""
+    global _REDACT_CACHE
+    if _REDACT_CACHE is None:
+        import os as _os
+        vals = []
+        for k in _TRAINING_ENV_BLOCKLIST:
+            v = _os.environ.get(k, "")
+            if len(v) >= 8:  # avoid redacting common short strings
+                vals.append(v)
+        _REDACT_CACHE = tuple(vals)
+    out = text
+    for v in _REDACT_CACHE:
+        out = out.replace(v, "<REDACTED>")
+    return out
 
 
 def _list_proof_sources(karpa_root: Path) -> list[Path]:
-    """Source files contributing to the container measurement.
-
-    Covers both repos: protocol (eval, calibration, proof) lives in
-    karpa_root; recipe (model, recipe, data) lives in RECIPE_DIR.
-    """
+    """DEPRECATED — kept for any in-tree caller. New code uses
+    proof.sources.list_proof_sources which produces (base, rel) tuples
+    that hash to the same digest from any filesystem layout."""
     from karpa_bootstrap import RECIPE_DIR
-    sources: list[tuple[Path, list[str]]] = [
-        (RECIPE_DIR, ["model", "recipe", "data", "configs"]),
-        (karpa_root, ["eval", "calibration", "proof"]),
-    ]
-    out: list[Path] = []
-    for base, dirs in sources:
-        for d in dirs:
-            path = base / d
-            if not path.exists():
-                continue
-            for p in sorted(path.rglob("*")):
-                if p.is_file() and "__pycache__" not in p.parts and p.suffix in {".py", ".yaml", ".json", ".md"}:
-                    out.append(p)
-    for f in ["restricted_files.yaml", "README.md"]:
-        path = karpa_root / f
-        if path.exists():
-            out.append(path)
-    return out
+    from proof.sources import list_proof_sources
+    return [base / rel for base, rel in list_proof_sources(karpa_root, RECIPE_DIR)]
 
 
 def _load_restricted_paths(restricted_yaml: Path) -> list[str]:
@@ -175,7 +232,8 @@ def run_proof_test(
     # 1. Compute container measurement BEFORE patching (the canonical recipe's
     #    measurement). The container_measurement in Phase 0.5+ is the Docker
     #    image digest, which is independent of any miner patch.
-    container_measurement = compute_container_measurement(_list_proof_sources(karpa_root))
+    from karpa_bootstrap import RECIPE_DIR
+    container_measurement = compute_container_measurement(karpa_root, recipe_dir=RECIPE_DIR)
 
     # 2. Scan the patch for restricted-file violations.
     restricted_yaml = karpa_root / "restricted_files.yaml"
@@ -236,13 +294,21 @@ def run_proof_test(
     train_result = subprocess.run(
         train_cmd,
         cwd=workdir,
-        env={**__import__("os").environ, "PYTHONPATH": str(workdir.resolve())},
+        # SAFE env: allowlist + scrubbed blocklist. The training subprocess is
+        # miner-controlled via patch.diff — it must not see HF/GH tokens, the
+        # wallet password, or any cloud creds. See deep_review_2026-05-31 #2.
+        env=_sanitized_env(extra={"PYTHONPATH": str(workdir.resolve())}),
         capture_output=True,
         text=True,
     )
     if train_result.returncode != 0:
-        raise RuntimeError(f"training failed:\nstdout:\n{train_result.stdout}\nstderr:\n{train_result.stderr}")
-    print(train_result.stdout)
+        # Redact known secrets from stdout/stderr before re-raising or
+        # logging — even with the env allowlist above, defense-in-depth.
+        raise RuntimeError(
+            "training failed:\nstdout:\n" + _redacted(train_result.stdout)
+            + "\nstderr:\n" + _redacted(train_result.stderr)
+        )
+    print(_redacted(train_result.stdout))
 
     # 5. Run calibration benchmark in the same environment.
     cal_result = run_calibration(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
