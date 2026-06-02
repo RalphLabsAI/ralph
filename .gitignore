@@ -104,3 +104,6 @@ secrets.yaml
 TODO.local.md
 /docs/deep_review_*.md
 /docs/deep_review_*.json
+
+# Twitter post drafts — local only, never committed
+twitter_posts/
