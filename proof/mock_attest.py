@@ -91,13 +91,44 @@ def _sign(payload: dict, container_measurement: str) -> str:
 def compute_container_measurement(source_files: Sequence[Path]) -> str:
     """The 'container measurement' for Phase 0: a hash of the proof-test source
     tree. In Phase 0.5+ this is replaced by the Docker image digest pinned
-    on-chain."""
+    on-chain.
+
+    DEPRECATED interface — kept for backward compatibility with old call sites
+    that pass a list of absolute Paths. New code should use
+    proof.sources.compute_container_measurement(karpa_root, recipe_dir=...)
+    which hashes repo-relative POSIX paths so different filesystem layouts
+    produce the same digest. See deep_review_2026-05-31 critical #10/#11.
+    """
     h = hashlib.sha256()
-    for path in sorted(source_files):
-        h.update(str(path).encode("utf-8"))
+    # Try to make the legacy path-based hash relative when we can detect a
+    # common prefix. Without a prefix we fall back to the absolute path (the
+    # old behaviour), which preserves digests for any in-process caller still
+    # passing pre-resolved Paths. Cross-host parity requires the new
+    # proof.sources.compute_container_measurement.
+    paths = [Path(p) for p in source_files]
+    common = _common_parent(paths)
+    for path in sorted(paths):
+        key = path.relative_to(common).as_posix() if common else str(path)
+        h.update(key.encode("utf-8"))
         h.update(b"\x00")
-        h.update(Path(path).read_bytes())
+        h.update(path.read_bytes())
     return h.hexdigest()
+
+
+def _common_parent(paths: Sequence[Path]) -> Path | None:
+    """Return the deepest directory that is a parent of every path, or None."""
+    if not paths:
+        return None
+    parts_list = [p.parts for p in paths]
+    common: list[str] = []
+    for parts in zip(*parts_list):
+        if len(set(parts)) == 1:
+            common.append(parts[0])
+        else:
+            break
+    if not common:
+        return None
+    return Path(*common)
 
 
 def attestation_epoch(

@@ -100,17 +100,19 @@ def run_audit(
         out_dir=audit_out_dir,
     )
 
-    # Hidden-eval on the audit checkpoint.
-    ckpt = torch.load(audit_bundle.checkpoint_path, weights_only=False, map_location="cpu")
-    saved = ckpt["config"]
+    # Hidden-eval on the audit checkpoint — use the SAFE checkpoint loader to
+    # avoid pickle RCE on miner-controlled bundles (deep_review #1).
+    from validator.validator import _safe_load_checkpoint_config, _safe_load_checkpoint_weights
+    saved = _safe_load_checkpoint_config(audit_bundle.checkpoint_path)
+    audit_state = _safe_load_checkpoint_weights(audit_bundle.checkpoint_path)
     cfg = KarpaConfig(
         vocab_size=saved["vocab_size"], dim=saved["dim"],
         n_layers=saved["n_layers"], n_heads=saved["n_heads"],
-        head_dim=saved["head_dim"], ffn_mult=saved["ffn_mult"],
+        head_dim=saved["head_dim"], ffn_mult=saved.get("ffn_mult", 8 / 3),
         max_seq_len=saved["max_seq_len"],
     )
     model = KarpaBase(cfg)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(audit_state)
     if torch.cuda.is_available():
         model = model.cuda()
     eval_result = run_hidden_eval(
@@ -118,13 +120,11 @@ def run_audit(
         seq_len=cfg.max_seq_len // 2,
     )
 
-    # Hidden-eval on the miner's checkpoint for comparison.
-    miner_ckpt = torch.load(
-        miner_proof / "training" / "checkpoint.pt",
-        weights_only=False, map_location="cpu",
-    )
+    # Hidden-eval on the miner's checkpoint for comparison — same SAFE loader.
+    miner_ckpt_path = miner_proof / "training" / "checkpoint.pt"
+    miner_state = _safe_load_checkpoint_weights(miner_ckpt_path)
     miner_model = KarpaBase(cfg)
-    miner_model.load_state_dict(miner_ckpt["model"])
+    miner_model.load_state_dict(miner_state)
     if torch.cuda.is_available():
         miner_model = miner_model.cuda()
     miner_eval = run_hidden_eval(

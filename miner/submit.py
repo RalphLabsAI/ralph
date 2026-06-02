@@ -96,16 +96,46 @@ def _ensure_keypair(karpa_root: Path, miner_hotkey: str) -> tuple[bytes, bytes]:
     except ImportError:  # pragma: no cover
         raise RuntimeError("install `cryptography` for Phase 0 signer support") from None
 
+    import os as _os
     keys_dir = karpa_root / "miner" / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        keys_dir.chmod(0o700)
+    except OSError:
+        pass  # filesystem may not support chmod (e.g. some Docker bind mounts)
     sk_path = keys_dir / f"{miner_hotkey}.sk"
     pk_path = keys_dir / f"{miner_hotkey}.pk"
     if not sk_path.exists():
         sk = Ed25519PrivateKey.generate()
         sk_bytes = sk.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
         pk_bytes = sk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-        sk_path.write_bytes(sk_bytes)
-        pk_path.write_bytes(pk_bytes)
+        # Write under a restrictive umask so we never race with chmod.
+        old_umask = _os.umask(0o077)
+        try:
+            sk_path.write_bytes(sk_bytes)
+            pk_path.write_bytes(pk_bytes)
+        finally:
+            _os.umask(old_umask)
+        try:
+            sk_path.chmod(0o600)
+            pk_path.chmod(0o644)
+        except OSError:
+            pass
+
+    # Audit existing key file modes — reject loading if the private key is
+    # readable by anyone but the owner. Defense-in-depth: prevents a previously
+    # leaked key from being silently re-used.
+    try:
+        sk_mode = sk_path.stat().st_mode & 0o077
+        if sk_mode != 0:
+            raise RuntimeError(
+                f"refusing to load private key {sk_path}: mode allows group/other "
+                f"access (octal {oct(sk_path.stat().st_mode & 0o777)}). "
+                f"chmod 600 {sk_path} or regenerate."
+            )
+    except FileNotFoundError:
+        pass  # was just created; will be 0600
+
     return sk_path.read_bytes(), pk_path.read_bytes()
 
 
