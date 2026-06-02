@@ -102,3 +102,5 @@ secrets.yaml
 # --- Misc ---
 .notes/
 TODO.local.md
+/docs/deep_review_*.md
+/docs/deep_review_*.json
