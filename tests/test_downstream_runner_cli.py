@@ -197,10 +197,11 @@ class TestBuildTaskLoaders:
         assert callable(loaders["arc_easy"])
 
     def test_core22_loader_calls_core22_load(self, tmp_path):
-        """The bound loader reaches core22.load_task_examples, which is
-        a stub today and raises NotImplementedError."""
+        """The bound loader reaches core22.load_task_examples, which now
+        looks for {bundle_dir}/arc_easy.jsonl. Empty bundle_dir →
+        FileNotFoundError naming the missing file."""
         loaders = _build_task_loaders(("arc_easy",), tmp_path)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(FileNotFoundError, match=r"arc_easy.jsonl"):
             loaders["arc_easy"]()
 
     def test_private_hard_loader_calls_private_hard_load(self, tmp_path):
