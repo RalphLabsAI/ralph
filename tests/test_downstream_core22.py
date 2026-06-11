@@ -349,16 +349,140 @@ def test_to_cell_result_rejects_unknown_task():
 
 
 # ----------------------------------------------------------------------------
-# load_task_examples stub
+# load_task_examples — canonical JSONL parser
 # ----------------------------------------------------------------------------
 
 
-def test_load_task_examples_raises_not_implemented(tmp_path):
-    """The stub must raise loudly with a clear pointer to the protocol
-    the first downloader commit must follow."""
-    with pytest.raises(NotImplementedError) as exc_info:
+def _write_jsonl(path, rows):
+    """Helper: write a list of dicts as a JSONL file."""
+    import json as _json
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+
+
+def test_load_task_examples_unknown_task_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"unknown task"):
+        load_task_examples(tmp_path, "not_a_real_task")
+
+
+def test_load_task_examples_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match=r"CORE-22 task file"):
         load_task_examples(tmp_path, "arc_easy")
-    msg = str(exc_info.value)
-    assert "DEFERRED.md" in msg
-    assert "B1-D2" in msg
-    assert DCLM_EVAL_BUNDLE_URL in msg
+
+
+def test_load_task_examples_mc_happy_path(tmp_path):
+    """An MC task (arc_easy) parses to MCRawRow list."""
+    _write_jsonl(tmp_path / "arc_easy.jsonl", [
+        {"id": "a1", "query": "Q1?", "choices": ["A", "B", "C", "D"], "gold": 0},
+        {"id": "a2", "query": "Q2?", "choices": ["W", "X"], "gold": 1},
+    ])
+    rows = load_task_examples(tmp_path, "arc_easy")
+    assert len(rows) == 2
+    assert all(isinstance(r, MCRawRow) for r in rows)
+    assert rows[0].query == "Q1?"
+    assert rows[0].choices == ["A", "B", "C", "D"]
+    assert rows[0].gold == 0
+    assert rows[1].gold == 1
+
+
+def test_load_task_examples_schema_happy_path(tmp_path):
+    """A schema task (winogrande) parses to SchemaRawRow list."""
+    _write_jsonl(tmp_path / "winogrande.jsonl", [
+        {"id": "w1",
+         "contexts": ["The trophy didn't fit in the brown suitcase because it",
+                      "The trophy didn't fit in the brown suitcase because it"],
+         "continuations": ["was too big", "was too small"],
+         "gold": 0},
+    ])
+    rows = load_task_examples(tmp_path, "winogrande")
+    assert len(rows) == 1
+    assert isinstance(rows[0], SchemaRawRow)
+    assert len(rows[0].contexts) == 2
+    assert rows[0].gold == 0
+
+
+def test_load_task_examples_lm_happy_path(tmp_path):
+    """An LM task (lambada_openai) parses to LMRawRow list."""
+    _write_jsonl(tmp_path / "lambada_openai.jsonl", [
+        {"id": "l1", "context": "Once upon a", "target": " time"},
+        {"id": "l2", "context": "The quick brown", "target": " fox",
+         "accept_set": [" fox", " Fox"]},
+    ])
+    rows = load_task_examples(tmp_path, "lambada_openai")
+    assert len(rows) == 2
+    assert all(isinstance(r, LMRawRow) for r in rows)
+    assert rows[0].context == "Once upon a"
+    assert rows[0].target == " time"
+    assert rows[0].accept_set == ()
+    assert rows[1].accept_set == (" fox", " Fox")
+
+
+def test_load_task_examples_skips_blank_lines(tmp_path):
+    """Blank lines in the JSONL are skipped, not parsed as bad JSON."""
+    path = tmp_path / "arc_easy.jsonl"
+    path.write_text(
+        '{"id": "a", "query": "q", "choices": ["x", "y"], "gold": 0}\n'
+        '\n'
+        '   \n'
+        '{"id": "b", "query": "q", "choices": ["x", "y"], "gold": 1}\n'
+    )
+    rows = load_task_examples(tmp_path, "arc_easy")
+    assert len(rows) == 2
+
+
+def test_load_task_examples_invalid_json_raises(tmp_path):
+    """A bad line raises with the line number."""
+    path = tmp_path / "arc_easy.jsonl"
+    path.write_text(
+        '{"id": "a", "query": "q", "choices": ["x", "y"], "gold": 0}\n'
+        '{not valid json\n'
+    )
+    with pytest.raises(ValueError, match=r":2"):
+        load_task_examples(tmp_path, "arc_easy")
+
+
+def test_load_task_examples_mc_missing_field_raises(tmp_path):
+    _write_jsonl(tmp_path / "arc_easy.jsonl", [
+        {"id": "a", "query": "q", "choices": ["x", "y"]},  # no 'gold'
+    ])
+    with pytest.raises(ValueError, match=r"canonical MC schema"):
+        load_task_examples(tmp_path, "arc_easy")
+
+
+def test_load_task_examples_mc_out_of_range_gold_raises(tmp_path):
+    _write_jsonl(tmp_path / "arc_easy.jsonl", [
+        {"id": "a", "query": "q", "choices": ["x", "y"], "gold": 5},
+    ])
+    with pytest.raises(ValueError, match=r"gold=5 out of range"):
+        load_task_examples(tmp_path, "arc_easy")
+
+
+def test_load_task_examples_mc_non_string_choice_raises(tmp_path):
+    _write_jsonl(tmp_path / "arc_easy.jsonl", [
+        {"id": "a", "query": "q", "choices": ["x", 42], "gold": 0},
+    ])
+    with pytest.raises(ValueError, match=r"list of strings"):
+        load_task_examples(tmp_path, "arc_easy")
+
+
+def test_load_task_examples_schema_length_mismatch_raises(tmp_path):
+    _write_jsonl(tmp_path / "winogrande.jsonl", [
+        {"id": "w", "contexts": ["a", "b"], "continuations": ["x"], "gold": 0},
+    ])
+    with pytest.raises(ValueError, match=r"length mismatch"):
+        load_task_examples(tmp_path, "winogrande")
+
+
+def test_load_task_examples_lm_missing_context_raises(tmp_path):
+    _write_jsonl(tmp_path / "lambada_openai.jsonl", [
+        {"id": "l", "target": " time"},  # missing 'context'
+    ])
+    with pytest.raises(ValueError, match=r"canonical LM schema"):
+        load_task_examples(tmp_path, "lambada_openai")
+
+
+def test_load_task_examples_lm_bad_accept_set_type_raises(tmp_path):
+    _write_jsonl(tmp_path / "lambada_openai.jsonl", [
+        {"id": "l", "context": "x", "target": "y", "accept_set": "not a list"},
+    ])
+    with pytest.raises(ValueError, match=r"accept_set.*list"):
+        load_task_examples(tmp_path, "lambada_openai")

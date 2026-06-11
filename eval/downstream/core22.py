@@ -12,18 +12,21 @@ catalogued by:
     baseline as a fraction in [0, 1]
 
 The bundle URL + SHA pin are constants here so the runner can verify the
-on-disk mirror against the expected upstream version. The actual bundle
-fetch + jsonl parsing is deferred to a follow-up commit once the bundle
-is downloaded and its SHA is pinned (B1-D2 protocol). For now the
-loader stub raises a clear NotImplementedError that the runner.py
-author will resolve.
+on-disk mirror against the expected upstream version. `load_task_examples`
+parses per-task JSONLs from a local bundle copy and dispatches to the
+per-mode parser (mc / schema / lm) to produce typed raw rows. The
+actual bundle FETCH (download + SHA verification + local mirror) is a
+separate operational step — `load_task_examples` takes the bundle
+directory as an input and reads from there.
 
 Reference scope: docs/build_scope/02_scope_B1.md "core22.py".
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from .scorer import (
     LMExample,
@@ -298,26 +301,189 @@ def to_cell_result(
 # ----------------------------------------------------------------------------
 
 
-def load_task_examples(bundle_dir, task_name: str):
-    """Load raw rows for a task from the DCLM bundle.
+def _read_jsonl(path: Path) -> list[dict]:
+    """Iterate a JSONL file into a list of dicts. Skips blank lines.
 
-    NOT IMPLEMENTED in this commit. The bundle layout follows DCLM's
-    `eval_bundle/<task_name>.jsonl` convention with per-task schemas
-    that the runner.py author will parse.
-
-    Until the bundle SHA is pinned (B1-D2), this raises a clear error
-    pointing at the protocol the first downloader commit must follow.
-    Callers that test against fixture data can use
-    `make_mc_example` / `make_schema_example` / `make_lm_example`
-    directly without going through this loader.
+    Raises ValueError naming the offending line on the first invalid
+    JSON line, so a downloader / mirror that produced a corrupt file
+    fails clean rather than silently dropping examples.
     """
-    raise NotImplementedError(
-        f"load_task_examples({task_name!r}) is not implemented in B1 "
-        "foundation. The first commit that downloads the bundle from "
-        f"{DCLM_EVAL_BUNDLE_URL} must (1) compute its SHA256, (2) update "
-        "DCLM_EVAL_BUNDLE_SHA256 in this module, (3) implement this "
-        "loader to parse <bundle_dir>/<task_name>.jsonl, and (4) add "
-        "tests/test_downstream_core22_bundle.py with one task driven "
-        "end-to-end against the real bundle. See eval/downstream/DEFERRED.md "
-        "items B1-D2 / B1-D13 / B1-D8 for the protocol."
+    rows: list[dict] = []
+    with path.open() as f:
+        for line_no, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                rows.append(json.loads(stripped))
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"invalid JSON at {path}:{line_no}: {e}"
+                ) from e
+    return rows
+
+
+def _parse_mc_row(row: dict, line_no: int) -> MCRawRow:
+    """Parse one canonical MC JSONL row.
+
+    Schema (canonical Karpa form):
+      {"id": str, "query": str, "choices": [str, ...], "gold": int}
+
+    `id` is consumed by callers that need item-level keying (e.g.
+    private-hard's HardnessIndex lookup). `_parse_mc_row` ignores it —
+    the loader returns plain MCRawRow / SchemaRawRow / LMRawRow without
+    the id; private-hard's `load_task_examples` (separate follow-up)
+    is the variant that preserves `(item_id, row)` pairs.
+    """
+    try:
+        query = str(row["query"])
+        choices = list(row["choices"])
+        gold = int(row["gold"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(
+            f"row {line_no}: expected canonical MC schema "
+            f"{{query, choices, gold}}; got error: {e}"
+        ) from e
+    if not all(isinstance(c, str) for c in choices):
+        raise ValueError(
+            f"row {line_no}: 'choices' must be a list of strings"
+        )
+    if not 0 <= gold < len(choices):
+        raise ValueError(
+            f"row {line_no}: gold={gold} out of range for "
+            f"{len(choices)} choices"
+        )
+    return MCRawRow(query=query, choices=choices, gold=gold)
+
+
+def _parse_schema_row(row: dict, line_no: int) -> SchemaRawRow:
+    """Parse one canonical schema JSONL row.
+
+    Schema: {"id": str, "contexts": [str, ...], "continuations": [str, ...],
+             "gold": int}
+
+    Each variant has its own (context, continuation) pair. `contexts` and
+    `continuations` must have the same length (one entry per variant).
+    """
+    try:
+        contexts = list(row["contexts"])
+        continuations = list(row["continuations"])
+        gold = int(row["gold"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(
+            f"row {line_no}: expected canonical schema "
+            f"{{contexts, continuations, gold}}; got error: {e}"
+        ) from e
+    if len(contexts) != len(continuations):
+        raise ValueError(
+            f"row {line_no}: contexts ({len(contexts)}) and "
+            f"continuations ({len(continuations)}) length mismatch"
+        )
+    if not all(isinstance(c, str) for c in contexts):
+        raise ValueError(
+            f"row {line_no}: 'contexts' must be a list of strings"
+        )
+    if not all(isinstance(c, str) for c in continuations):
+        raise ValueError(
+            f"row {line_no}: 'continuations' must be a list of strings"
+        )
+    if not 0 <= gold < len(contexts):
+        raise ValueError(
+            f"row {line_no}: gold={gold} out of range for "
+            f"{len(contexts)} variants"
+        )
+    return SchemaRawRow(
+        contexts=contexts, continuations=continuations, gold=gold,
     )
+
+
+def _parse_lm_row(row: dict, line_no: int) -> LMRawRow:
+    """Parse one canonical LM JSONL row.
+
+    Schema: {"id": str, "context": str, "target": str,
+             "accept_set": [str, ...] | optional}
+
+    `accept_set` is the set of accepted completions for LM tasks that
+    allow multiple gold answers (e.g., a question whose answer can be
+    phrased several ways). Optional — defaults to () for LAMBADA-style
+    tasks with a single target.
+    """
+    try:
+        context = str(row["context"])
+        target = str(row["target"])
+    except (KeyError, TypeError) as e:
+        raise ValueError(
+            f"row {line_no}: expected canonical LM schema "
+            f"{{context, target}}; got error: {e}"
+        ) from e
+    accept_raw = row.get("accept_set", [])
+    if not isinstance(accept_raw, list):
+        raise ValueError(
+            f"row {line_no}: 'accept_set' must be a list if provided"
+        )
+    if not all(isinstance(a, str) for a in accept_raw):
+        raise ValueError(
+            f"row {line_no}: 'accept_set' must be a list of strings"
+        )
+    return LMRawRow(
+        context=context, target=target, accept_set=tuple(accept_raw),
+    )
+
+
+def load_task_examples(
+    bundle_dir: Path | str,
+    task_name: str,
+) -> list[MCRawRow | SchemaRawRow | LMRawRow]:
+    """Load raw rows for a CORE-22 task from a local DCLM bundle copy.
+
+    Reads `{bundle_dir}/{task_name}.jsonl` and parses each line per
+    the task's mode (per `TASK_SPECS[task_name].mode`):
+      * mode == "mc"     → MCRawRow
+      * mode == "schema" → SchemaRawRow
+      * mode == "lm"     → LMRawRow
+
+    The JSONL schema is the canonical Karpa form documented in
+    `_parse_mc_row` / `_parse_schema_row` / `_parse_lm_row`. If the
+    DCLM bundle's per-task JSONLs use different keys, the
+    downloader / mirror script (separate follow-up) is responsible for
+    re-keying into this canonical schema during the bundle-prep step.
+
+    Args:
+      bundle_dir: directory containing per-task `<task>.jsonl` files.
+      task_name: one of `DCLM_CORE_22_TASKS`.
+
+    Raises:
+      ValueError if `task_name` is unknown.
+      FileNotFoundError if `{bundle_dir}/{task_name}.jsonl` doesn't exist.
+      ValueError if any row in the JSONL fails per-mode parsing, with a
+        message naming the line number and the missing/invalid field.
+    """
+    if task_name not in TASK_SPECS:
+        raise ValueError(
+            f"unknown task {task_name!r}; not in DCLM_CORE_22_TASKS"
+        )
+    bundle_dir = Path(bundle_dir)
+    path = bundle_dir / f"{task_name}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"CORE-22 task file not found: {path}. The bundle download "
+            f"(URL {DCLM_EVAL_BUNDLE_URL}) must place per-task JSONLs "
+            "under the supplied bundle_dir."
+        )
+
+    spec = TASK_SPECS[task_name]
+    raw_rows = _read_jsonl(path)
+    parsed: list[MCRawRow | SchemaRawRow | LMRawRow] = []
+    for i, row in enumerate(raw_rows, start=1):
+        if spec.mode == "mc":
+            parsed.append(_parse_mc_row(row, i))
+        elif spec.mode == "schema":
+            parsed.append(_parse_schema_row(row, i))
+        elif spec.mode == "lm":
+            parsed.append(_parse_lm_row(row, i))
+        else:
+            raise ValueError(
+                f"task {task_name!r} has unsupported mode "
+                f"{spec.mode!r}; expected mc/schema/lm"
+            )
+    return parsed
