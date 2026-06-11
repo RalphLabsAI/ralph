@@ -149,3 +149,107 @@ rename to y.py
     paths = _extract_diff_paths(diff)
     assert "x.py" in paths
     assert "y.py" in paths
+
+
+# ----------------------------------------------------------------------------
+# B1-D10: explicit globs for downstream-eval harness + pooled data dirs.
+# Even though eval/** already covers all of these, the yaml lists them
+# explicitly. These tests pin BOTH the eval/** coverage AND the
+# explicit-globs behavior.
+# ----------------------------------------------------------------------------
+
+# The full live restricted-paths list from restricted_files.yaml, including
+# the B1-D10 explicit globs. Hard-coded rather than parsed so the test
+# fails loudly if someone removes a glob from the yaml without updating
+# the test.
+LIVE_RESTRICTED = [
+    "eval/**",
+    "eval/downstream/**",
+    "eval/private/downstream_pool/**",
+    "eval/private/hardness/**",
+    "eval/private/calibration/**",
+    "calibration/**",
+    "validator/**",
+    "proof/**",
+    "restricted_files.yaml",
+    "data_manifest.json",
+]
+
+
+def _diff_touching(path: str) -> str:
+    return f"""diff --git a/{path} b/{path}
+--- a/{path}
++++ b/{path}
+@@ -1 +1 @@
+-old
++new
+"""
+
+
+def test_eval_downstream_runner_blocked():
+    """A patch touching eval/downstream/runner.py is rejected."""
+    diff = _diff_touching("eval/downstream/runner.py")
+    assert "eval/downstream/runner.py" in scan_diff_for_restricted(
+        diff, LIVE_RESTRICTED,
+    )
+
+
+def test_eval_downstream_aggregate_blocked():
+    """The Pareto kernel — protected against tampering."""
+    diff = _diff_touching("eval/downstream/aggregate.py")
+    assert "eval/downstream/aggregate.py" in scan_diff_for_restricted(
+        diff, LIVE_RESTRICTED,
+    )
+
+
+def test_eval_downstream_calibration_blocked():
+    diff = _diff_touching("eval/downstream/calibration.py")
+    assert "eval/downstream/calibration.py" in scan_diff_for_restricted(
+        diff, LIVE_RESTRICTED,
+    )
+
+
+def test_eval_private_downstream_pool_blocked():
+    """The cached DCLM eval bundle — must not be modifiable."""
+    diff = _diff_touching("eval/private/downstream_pool/bundle_v1/hellaswag.jsonl")
+    assert (
+        "eval/private/downstream_pool/bundle_v1/hellaswag.jsonl"
+        in scan_diff_for_restricted(diff, LIVE_RESTRICTED)
+    )
+
+
+def test_eval_private_hardness_blocked():
+    """The private hardness-index JSONL — the bottom-quintile selection."""
+    diff = _diff_touching("eval/private/hardness/hardness_index_v1.jsonl")
+    assert (
+        "eval/private/hardness/hardness_index_v1.jsonl"
+        in scan_diff_for_restricted(diff, LIVE_RESTRICTED)
+    )
+
+
+def test_eval_private_calibration_blocked():
+    """noise_floors_v1.json — the king-rule threshold floors."""
+    diff = _diff_touching("eval/private/calibration/noise_floors_v1.json")
+    assert (
+        "eval/private/calibration/noise_floors_v1.json"
+        in scan_diff_for_restricted(diff, LIVE_RESTRICTED)
+    )
+
+
+def test_b1_d10_explicit_globs_present_in_live_yaml():
+    """Read the live restricted_files.yaml and verify the B1-D10 globs
+    are recorded. Catches accidental removals."""
+    import os.path
+    yaml_path = Path(__file__).resolve().parent.parent / "restricted_files.yaml"
+    text = yaml_path.read_text()
+    assert os.path.exists(yaml_path), f"restricted_files.yaml not found at {yaml_path}"
+    for glob in (
+        "eval/downstream/**",
+        "eval/private/downstream_pool/**",
+        "eval/private/hardness/**",
+        "eval/private/calibration/**",
+    ):
+        assert f'"{glob}"' in text, (
+            f"B1-D10 explicit glob {glob!r} missing from "
+            "restricted_files.yaml — see DEFERRED.md B1-D10"
+        )
