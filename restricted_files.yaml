@@ -13,6 +13,17 @@ restricted_paths:
   # Evaluation harness — owns val_bpb, benchmark mix, scoring formula.
   - "eval/**"
 
+  # Downstream-eval (B1-D10) — explicit globs for the harness + pooled
+  # data dirs. Redundant with eval/** above, but stated explicitly so
+  # the protection survives any future narrowing of eval/** and so the
+  # yaml self-documents what specifically is locked. These paths host
+  # the DCLM CORE-22 bundle copy, the private hardness subset, and the
+  # noise-floor calibration outputs that the validator owns.
+  - "eval/downstream/**"
+  - "eval/private/downstream_pool/**"
+  - "eval/private/hardness/**"
+  - "eval/private/calibration/**"
+
   # Calibration benchmark — its timings are the hardware-independence anchor.
   - "calibration/**"
 
