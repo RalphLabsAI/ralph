@@ -22,10 +22,13 @@ What B1 has shipped so far:
     HardnessIndex assembly + JSONL round-trip
   * runner.py (kernel): EvalConfig + vocab/determinism guards +
     in-process run_downstream_eval driver (B1-D6, B1-D7 closed)
+  * runner_subprocess.py: caller-side subprocess wrapper +
+    EvalSubprocessError + JSON IPC contract for the (forthcoming)
+    CLI entrypoint
 
 What B1 will ship (separate commits within the phase):
-  * runner.py subprocess wrapper: CLI + JSON IPC + weights_only
-    checkpoint load + structural-patch path (B1-D5, B1-D13)
+  * runner_cli.py: argparse + weights_only checkpoint load +
+    structural-patch path (closes B1-D5, B1-D13)
   * calibration.py: N=10 baseline runs → noise_floors_v1.json
 
 Reference scope: docs/build_scope/02_scope_B1.md.
@@ -75,6 +78,14 @@ from .runner import (
     run_downstream_eval,
     set_eval_determinism,
 )
+from .runner_subprocess import (
+    DEFAULT_COMMAND_PREFIX,
+    STDERR_TAIL_LIMIT,
+    EvalSubprocessError,
+    deserialize_report,
+    run_eval_in_subprocess,
+    serialize_report,
+)
 from .scorer import (
     LMExample,
     MCExample,
@@ -105,8 +116,10 @@ __all__ = [
     "DCLM_CORE_22_TASKS",
     "DCLM_EVAL_BUNDLE_SHA256",
     "DCLM_EVAL_BUNDLE_URL",
+    "DEFAULT_COMMAND_PREFIX",
     "DownstreamReport",
     "EvalConfig",
+    "EvalSubprocessError",
     "HARNESS_VERSION",
     "HF_DATASET_IDS",
     "HardnessIndex",
@@ -124,6 +137,7 @@ __all__ = [
     "PRIVATE_HARD_TASK_SPECS",
     "ParetoOutcome",
     "ParetoVerdict",
+    "STDERR_TAIL_LIMIT",
     "SchemaExample",
     "SchemaRawRow",
     "TASK_SPECS",
@@ -132,6 +146,7 @@ __all__ = [
     "assemble_hardness_index",
     "check_vocab_compatibility",
     "compute_bottom_quintile",
+    "deserialize_report",
     "evaluate_lm_task_lambada",
     "evaluate_mc_task",
     "evaluate_private_hard_task",
@@ -144,12 +159,14 @@ __all__ = [
     "make_schema_example",
     "read_hardness_index_jsonl",
     "run_downstream_eval",
+    "run_eval_in_subprocess",
     "score_lm",
     "score_mc",
     "score_mc_logprobs",
     "score_schema",
     "score_schema_logprobs",
     "select_hardness_subset",
+    "serialize_report",
     "set_eval_determinism",
     "to_cell_result",
     "to_private_hard_cell_result",
