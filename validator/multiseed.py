@@ -117,13 +117,24 @@ def _mean_stderr(xs: list[float]) -> tuple[float, float]:
     correction (ddof=1). For n=1 the stderr is 0 by convention — there is
     only one observation, no within-sample variance to estimate. For
     byte-identical samples (n>=2 but all values equal) stderr is also 0.
+
+    Identical-sample short-circuit: when every element of `xs` equals
+    `xs[0]`, the mean is exactly `xs[0]` and stderr is exactly 0.0.
+    Without this guard, `sum(xs)/n` for n copies of X is generally NOT
+    equal to X in floating-point arithmetic — e.g. for n=3 the result
+    can differ from X in the last bit, which causes
+    `test_multiseed_three_runs_produce_byte_identical_results` to flake
+    on whichever values of X happen to round through `3X/3 != X`.
     """
     n = len(xs)
     if n == 0:
         return 0.0, 0.0
-    mean = sum(xs) / n
     if n == 1:
-        return mean, 0.0
+        return xs[0], 0.0
+    first = xs[0]
+    if all(x == first for x in xs):
+        return first, 0.0
+    mean = sum(xs) / n
     var = sum((x - mean) ** 2 for x in xs) / (n - 1)
     sample_std = math.sqrt(var)
     return mean, sample_std / math.sqrt(n)
