@@ -188,7 +188,14 @@ in eval/downstream/. No fictional symbol references.
 `karpa/restricted_files.yaml` (NOT the imaginary
 `karpa/validator/restricted_files.yaml`).
 **Recommendation:** Land in the same PR as core22.py.
-**Status:** OPEN
+**Status:** **CLOSED 2026-06-11.** All four explicit globs added to
+`karpa/restricted_files.yaml`. Note: the existing `eval/**` glob already
+matched these paths via `_path_matches`'s prefix/** semantics, so the
+new globs are functionally redundant — but they self-document the
+B1-specific protection and survive any future narrowing of `eval/**`.
+Six new tests in `tests/test_restricted_scanner.py` verify each glob
+blocks a representative path; one additional test reads the live yaml
+to catch accidental glob removals (B1-D10 regression guard).
 
 ### B1-D11 — Container measurement bump
 **Owner:** B1 (proof/sources.py author)
