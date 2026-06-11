@@ -17,9 +17,10 @@ from .sealed_streams import (
     select_active_streams,
     write_manifest,
 )
-from .val_bpb import compute_val_bpb
+from .val_bpb import DEFAULT_BYTES_PER_TOKEN, compute_val_bpb, compute_val_bpb_on_stream
 
 __all__ = [
+    "DEFAULT_BYTES_PER_TOKEN",
     "HiddenEvalResult",
     "MANIFEST_VERSION",
     "SealedStreamBatch",
@@ -29,6 +30,7 @@ __all__ = [
     "compute_benchmark_score",
     "compute_streams_root_hash",
     "compute_val_bpb",
+    "compute_val_bpb_on_stream",
     "load_stream",
     "read_manifest",
     "run_hidden_eval",
