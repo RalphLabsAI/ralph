@@ -54,14 +54,18 @@ EVAL_BUNDLE_URL. The bundle is hosted in Karpathy's personal S3, which
 means it CAN rotate without notice — the SHA pin below is the guard.
 """
 
-DCLM_EVAL_BUNDLE_SHA256: str | None = None
-"""SHA256 of the canonical bundle. Pinned at first download.
+DCLM_EVAL_BUNDLE_SHA256: str | None = (
+    "90a7c19e28ee7a52b4f6e1f87658deb9fde7f63deba2379045bdb1fe9ea5d200"
+)
+"""SHA256 of the canonical bundle. Pinned 2026-06-12 against the
+`download_dclm_bundle.py` manifest (`extracted_member_count = 86`).
 
-Today (B1 foundation) this is None — the bundle has not been
-downloaded yet. The first B1 code commit that actually fetches the
-bundle MUST update this constant with the verbatim sha256 and a
-matching `test_dclm_bundle_sha_pinned` test. Until then, callers
-should skip integrity verification with a clear log message.
+If a future pull mismatches, treat that as an upstream rotation: do
+NOT silently bump this constant. Re-derive the bundle's provenance
+(diff member list against the prior 86 entries) and bump only with
+a paired commit that lists what changed. Per B1-D2, this constant
+is FROZEN once pinned; downstream callers (`download_dclm_bundle`,
+`core22` integrity check) rely on a single-value match.
 """
 
 
@@ -465,11 +469,26 @@ def load_task_examples(
     bundle_dir = Path(bundle_dir)
     path = bundle_dir / f"{task_name}.jsonl"
     if not path.exists():
-        raise FileNotFoundError(
-            f"CORE-22 task file not found: {path}. The bundle download "
-            f"(URL {DCLM_EVAL_BUNDLE_URL}) must place per-task JSONLs "
-            "under the supplied bundle_dir."
-        )
+        # DCLM bundle layout nests tasks in category subdirs
+        # (eval_bundle/eval_data/{category}/{task}.jsonl). Walk the tree
+        # so callers can pass either the flat-mirror dir or the raw
+        # upstream bundle root and have lookups still resolve.
+        candidates = sorted(bundle_dir.rglob(f"{task_name}.jsonl"))
+        if len(candidates) == 1:
+            path = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                f"ambiguous task file location for {task_name!r}: "
+                f"{[str(c) for c in candidates]}. Flatten the bundle "
+                "or pass a more specific bundle_dir."
+            )
+        else:
+            raise FileNotFoundError(
+                f"CORE-22 task file {task_name}.jsonl not found under "
+                f"{bundle_dir} (searched flat + recursive). The bundle "
+                f"download (URL {DCLM_EVAL_BUNDLE_URL}) must place "
+                f"per-task JSONLs under the supplied bundle_dir."
+            )
 
     spec = TASK_SPECS[task_name]
     raw_rows = _read_jsonl(path)
