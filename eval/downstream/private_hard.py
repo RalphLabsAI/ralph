@@ -105,7 +105,7 @@ assert set(PRIVATE_HARD_TASK_SPECS.keys()) == set(PRIVATE_HARD_TASKS)
 HF_DATASET_IDS: dict[str, tuple[str, str | None]] = {
     "arc_challenge_hard": ("allenai/ai2_arc",            "ARC-Challenge"),
     "winogrande_hard":    ("allenai/winogrande",         "winogrande_xl"),
-    "tiny_arc":           ("tinyBenchmarks/tinyArc",     None),
+    "tiny_arc":           ("tinyBenchmarks/tinyAI2_arc", None),
     "tiny_mmlu":          ("tinyBenchmarks/tinyMMLU",    None),
 }
 """HuggingFace dataset identifiers per task: `(repo_id, config)`.

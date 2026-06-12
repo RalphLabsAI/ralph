@@ -54,14 +54,18 @@ EVAL_BUNDLE_URL. The bundle is hosted in Karpathy's personal S3, which
 means it CAN rotate without notice — the SHA pin below is the guard.
 """
 
-DCLM_EVAL_BUNDLE_SHA256: str | None = None
-"""SHA256 of the canonical bundle. Pinned at first download.
+DCLM_EVAL_BUNDLE_SHA256: str | None = (
+    "90a7c19e28ee7a52b4f6e1f87658deb9fde7f63deba2379045bdb1fe9ea5d200"
+)
+"""SHA256 of the canonical bundle. Pinned 2026-06-12 against the
+`download_dclm_bundle.py` manifest (`extracted_member_count = 86`).
 
-Today (B1 foundation) this is None — the bundle has not been
-downloaded yet. The first B1 code commit that actually fetches the
-bundle MUST update this constant with the verbatim sha256 and a
-matching `test_dclm_bundle_sha_pinned` test. Until then, callers
-should skip integrity verification with a clear log message.
+If a future pull mismatches, treat that as an upstream rotation: do
+NOT silently bump this constant. Re-derive the bundle's provenance
+(diff member list against the prior 86 entries) and bump only with
+a paired commit that lists what changed. Per B1-D2, this constant
+is FROZEN once pinned; downstream callers (`download_dclm_bundle`,
+`core22` integrity check) rely on a single-value match.
 """
 
 

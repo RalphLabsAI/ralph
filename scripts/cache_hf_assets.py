@@ -189,12 +189,27 @@ def convert_tinybench_mc_row(row: dict) -> dict | None:
 
 
 # Per-task converter dispatch table. The operator can swap converters here
-# if HF rotates a schema.
+# if HF rotates a schema. Note: tinyBenchmarks/tinyAI2_arc ships ARC's
+# native schema (`choices` is `{text, label}`, `answerKey` is a label
+# letter), so tiny_arc routes to convert_arc_row. tinyMMLU uses the
+# flatter `{question, choices: [str], answer: int}` schema and routes to
+# convert_tinybench_mc_row.
 TASK_CONVERTERS = {
     "arc_challenge_hard": convert_arc_row,
     "winogrande_hard": convert_winogrande_row,
-    "tiny_arc": convert_tinybench_mc_row,
+    "tiny_arc": convert_arc_row,
     "tiny_mmlu": convert_tinybench_mc_row,
+}
+
+# Per-task default split. ARC/Winogrande/tinyArc ship a `validation` split;
+# tinyMMLU only ships `test` and `dev`, so default to `test` (the held-out
+# items; `dev` is the IRT++ calibration set). `--split` on the CLI still
+# overrides every task globally if the operator asks for it.
+TASK_DEFAULT_SPLITS = {
+    "arc_challenge_hard": "validation",
+    "winogrande_hard": "validation",
+    "tiny_arc": "validation",
+    "tiny_mmlu": "test",
 }
 
 
@@ -280,10 +295,15 @@ def cache_all(
     tasks: tuple[str, ...] | None = None,
     hf_token: str | None = None,
     revisions: dict[str, str] | None = None,
-    split: str = "validation",
+    split: str | None = None,
 ) -> dict:
     """Drive cache_one_task across the requested tasks. Writes the
-    manifest. Returns the manifest dict."""
+    manifest. Returns the manifest dict.
+
+    If `split` is `None`, each task uses `TASK_DEFAULT_SPLITS[task]`.
+    Passing a non-None `split` forces the same split for every task
+    (operator override; useful when probing schemas).
+    """
     tasks = tasks or PRIVATE_HARD_TASKS
     revisions = revisions or {}
     output_dir = Path(output_dir)
@@ -291,12 +311,13 @@ def cache_all(
 
     entries: list[dict] = []
     for task in tasks:
+        task_split = split if split is not None else TASK_DEFAULT_SPLITS[task]
         entries.append(cache_one_task(
             task,
             output_dir=output_dir,
             hf_token=hf_token,
             revision=revisions.get(task),
-            split=split,
+            split=task_split,
         ))
 
     manifest = {
@@ -325,8 +346,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--revision", action="append", default=None,
                    help="pin a specific HF revision in the form task=<sha>; "
                         "repeat for multiple tasks")
-    p.add_argument("--split", default="validation",
-                   help="HF dataset split to pull (default: validation)")
+    p.add_argument("--split", default=None,
+                   help="HF dataset split to pull. If omitted, each task "
+                        "uses its TASK_DEFAULT_SPLITS entry "
+                        "(validation for ARC/winogrande/tinyArc; "
+                        "test for tinyMMLU, which lacks a validation split).")
     return p
 
 
