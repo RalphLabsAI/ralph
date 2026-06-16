@@ -138,6 +138,9 @@ experiments/
 # GitHub Discussion drafts — local only, never committed
 github_discussions/
 
+# Discord announcement drafts — local only, never committed
+discord_announcements/
+
 # Outbound email drafts — local only, never committed
 outbound/
 
