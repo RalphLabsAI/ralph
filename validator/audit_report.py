@@ -1,8 +1,8 @@
 """Owner-validator audit report — validation-v2 Phase 1.
 
-The owner validator (H200) is the single node that does the heavy hidden-eval
-scoring, sets weights, and — added here — anchors a per-epoch **audit
-commitment** on-chain so anyone can re-derive its decisions from published data.
+Ralph validators run the GPU hidden-eval scoring and set weights; this module
+anchors a per-epoch **audit commitment** on-chain so anyone can re-derive a
+validator's decisions from published data — auditors run on CPU, no GPU needed.
 
 This module builds that per-epoch report:
 
@@ -19,7 +19,7 @@ This module builds that per-epoch report:
   4. `write_report(...)` writes `<out_dir>/audit_reports/<epoch_id>.json` and
      upserts an `index.json` so an auditor can enumerate epochs.
 
-The owner cannot lie two ways: (a) commit a hash != raw report -> caught by
+A scoring validator cannot lie two ways: (a) commit a hash != raw report -> caught by
 re-hash; (b) commit a report whose weights != scorer(raw data) -> caught by
 replay. See docs/rearch_2026_06/childkey_owner_auditor_architecture.md.
 
