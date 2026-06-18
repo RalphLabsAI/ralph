@@ -275,12 +275,26 @@ def build_envelope(
 # ---------------------------------------------------------------------------
 
 
-def write_report(report_envelope: dict, out_dir: Path) -> Path:
+def write_report(
+    report_envelope: dict,
+    out_dir: Path,
+    *,
+    hf_publish_enabled: bool = False,
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None,
+) -> Path:
     """Write the signed report envelope + upsert the epoch index.
 
     Layout:
       <out_dir>/audit_reports/<epoch_id>.json   — the full signed envelope
       <out_dir>/audit_reports/index.json        — append-only epoch index
+
+    When `hf_publish_enabled` is True (prod only — default False), ALSO publish
+    the envelope + index to the HF dataset repo (`hf_repo`, default
+    RalphLabsAI/audit-reports) via validator.audit_publish. The on-chain
+    commitment is the trust anchor; HF is just the off-chain store auditors pull
+    from. The HF push is wrapped in try/except so a publish failure never breaks
+    the validator and never affects the (authoritative) local write below.
 
     Returns the path to the written per-epoch report.
     """
@@ -324,12 +338,24 @@ def write_report(report_envelope: dict, out_dir: Path) -> Path:
         json.dumps(index, indent=2, sort_keys=True, ensure_ascii=False)
     )
 
-    # TODO Phase 2: publish to HF — upload `report_path` + `index.json` to
-    # RalphLabsAI/audit-reports so auditors pull from the Hub. The on-chain
-    # commitment remains the trust anchor; HF is just the off-chain store.
-    # e.g. huggingface_hub.upload_file(path_or_fileobj=report_path,
-    #          path_in_repo=f"audit_reports/{epoch_id}.json",
-    #          repo_id="RalphLabsAI/audit-reports", repo_type="dataset")
+    # Phase 2 (A): publish the signed envelope + index to HF so auditors pull
+    # from the Hub. Local write above is authoritative; the on-chain commitment
+    # is the trust anchor. Gated behind hf_publish_enabled (prod-only) and
+    # never allowed to break the validator.
+    if hf_publish_enabled:
+        try:
+            from validator.audit_publish import DEFAULT_AUDIT_REPO, publish_report_hf
+
+            publish_report_hf(
+                report_envelope,
+                repo_id=hf_repo or DEFAULT_AUDIT_REPO,
+                token=hf_token,
+            )
+        except Exception:
+            # Best-effort: a publish failure (auth, network, rate-limit) must
+            # not affect the validator or the local report. The caller in
+            # service._generate_audit_report logs at a higher level.
+            pass
 
     return report_path
 
