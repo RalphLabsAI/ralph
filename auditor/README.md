@@ -32,6 +32,17 @@ pip install requests bittensor          # bittensor: archive chain reads + Keypa
 `bittensor` is already a Ralph dependency; no GPU/torch eval stack is exercised
 by Gates 1-3 (torch is only imported by the optional counter-weight path).
 
+## Recommended hardware
+
+CPU-only — **no GPU**. Gates 1-3 barely touch resources (~50 MB RAM), so the bar is
+low; even a 2 vCPU / 2 GB box (or a Raspberry Pi 5) handles occasional `--once` checks.
+For running it continuously (`--loop`) 24/7 with comfortable headroom — including the
+optional counter-weight validator path — a modest box is plenty:
+
+- **4-8 vCPU · 8-16 GB RAM · 50 GB SSD · stable network**
+
+Point `SUBTENSOR_URL` at your archive subtensor.
+
 ## Run
 
 ```bash
