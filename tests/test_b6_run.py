@@ -42,11 +42,12 @@ def _set_test_mode(monkeypatch):
 
 
 def _b6_recipe_with_single_rung_only() -> tuple:
-    """Override the standard rungs to a single S3 rung for tests against
-    the synthetic CLI (which hard-codes its cell key).
+    """Pin the rungs to a bare single S3 rung (no per-task cap) for tests
+    against the synthetic CLI (which hard-codes its cell key).
 
-    NOTE: run_one_recipe + run_b6 use _B6_STANDARD_RUNGS (3-rung) by
-    contract. For tests we monkey-patch the constant.
+    The canonical `_B6_STANDARD_RUNGS` is also a single S3 rung but carries
+    `n_examples_per_task=100`; tests use synthetic fixtures where the cap is
+    irrelevant, so this keeps them decoupled from that value.
     """
     from validator.ladder import LadderRungSpec
     return (LadderRungSpec(scale_label="S3", dim=768, n_layers=12),)
