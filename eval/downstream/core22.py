@@ -361,22 +361,38 @@ def _parse_mc_row(row: dict, line_no: int) -> MCRawRow:
 
 
 def _parse_schema_row(row: dict, line_no: int) -> SchemaRawRow:
-    """Parse one canonical schema JSONL row.
+    """Parse one schema JSONL row.
 
-    Schema: {"id": str, "contexts": [str, ...], "continuations": [str, ...],
-             "gold": int}
+    DCLM/OLMES bundle form (what's actually on disk for winograd_wsc /
+    winogrande): {"context_options": [str, ...], "continuation": str,
+    "gold": int} — N candidate contexts sharing ONE continuation; the
+    model scores the shared continuation under each context and the
+    argmax is compared to `gold` (winograd-schema scoring).
 
-    Each variant has its own (context, continuation) pair. `contexts` and
-    `continuations` must have the same length (one entry per variant).
+    Legacy form (kept for back-compat with hand-built fixtures):
+    {"contexts": [str, ...], "continuations": [str, ...], "gold": int}
+    with one continuation per variant.
+
+    Either form is normalised into `SchemaRawRow` (parallel contexts /
+    continuations lists); the DCLM form broadcasts its single
+    continuation across every context option.
     """
     try:
-        contexts = list(row["contexts"])
-        continuations = list(row["continuations"])
+        if "context_options" in row:  # real DCLM/OLMES schema format
+            contexts = list(row["context_options"])
+            continuation = row["continuation"]
+            if not isinstance(continuation, str):
+                raise TypeError("'continuation' must be a string")
+            continuations = [continuation] * len(contexts)
+        else:  # legacy canonical form (one continuation per variant)
+            contexts = list(row["contexts"])
+            continuations = list(row["continuations"])
         gold = int(row["gold"])
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(
-            f"row {line_no}: expected canonical schema "
-            f"{{contexts, continuations, gold}}; got error: {e}"
+            f"row {line_no}: expected schema "
+            f"{{context_options, continuation, gold}} "
+            f"(or legacy {{contexts, continuations, gold}}); got error: {e}"
         ) from e
     if len(contexts) != len(continuations):
         raise ValueError(
@@ -402,23 +418,28 @@ def _parse_schema_row(row: dict, line_no: int) -> SchemaRawRow:
 
 
 def _parse_lm_row(row: dict, line_no: int) -> LMRawRow:
-    """Parse one canonical LM JSONL row.
+    """Parse one LM JSONL row.
 
-    Schema: {"id": str, "context": str, "target": str,
-             "accept_set": [str, ...] | optional}
+    DCLM bundle form (what's actually on disk for lambada / squad / coqa /
+    jeopardy / bigbench_* lm tasks): {"context": str, "continuation": str}
+    — the gold completion is keyed `continuation`. Extra keys (e.g.
+    `category`) are ignored.
+
+    Legacy form (kept for back-compat with hand-built fixtures):
+    {"context": str, "target": str, "accept_set": [str, ...] | optional}.
 
     `accept_set` is the set of accepted completions for LM tasks that
-    allow multiple gold answers (e.g., a question whose answer can be
-    phrased several ways). Optional — defaults to () for LAMBADA-style
-    tasks with a single target.
+    allow multiple gold answers. Optional — defaults to () for
+    LAMBADA-style tasks with a single target.
     """
     try:
         context = str(row["context"])
-        target = str(row["target"])
+        # DCLM keys the gold completion `continuation`; legacy fixtures use `target`.
+        target = str(row["continuation"] if "continuation" in row else row["target"])
     except (KeyError, TypeError) as e:
         raise ValueError(
-            f"row {line_no}: expected canonical LM schema "
-            f"{{context, target}}; got error: {e}"
+            f"row {line_no}: expected LM schema {{context, continuation}} "
+            f"(or legacy {{context, target}}); got error: {e}"
         ) from e
     accept_raw = row.get("accept_set", [])
     if not isinstance(accept_raw, list):
@@ -434,31 +455,44 @@ def _parse_lm_row(row: dict, line_no: int) -> LMRawRow:
     )
 
 
+# CORE-22 task names whose DCLM bundle filename stem differs from the task
+# name (same underlying data). Resolved in `load_task_examples`:
+#   * winograd          → winograd_wsc.jsonl  (upstream WSC file name)
+#   * hellaswag_zeroshot → hellaswag.jsonl    (same data, 0-shot rendering)
+#   * jeopardy          → jeopardy_all.jsonl  (full 2117-item set, not _small)
+_BUNDLE_FILE_ALIASES: dict[str, str] = {
+    "winograd": "winograd_wsc",
+    "hellaswag_zeroshot": "hellaswag",
+    "jeopardy": "jeopardy_all",
+}
+
+
 def load_task_examples(
     bundle_dir: Path | str,
     task_name: str,
 ) -> list[MCRawRow | SchemaRawRow | LMRawRow]:
     """Load raw rows for a CORE-22 task from a local DCLM bundle copy.
 
-    Reads `{bundle_dir}/{task_name}.jsonl` and parses each line per
+    Reads `{bundle_dir}/{file_stem}.jsonl` (where `file_stem` is the task
+    name, or its `_BUNDLE_FILE_ALIASES` override) and parses each line per
     the task's mode (per `TASK_SPECS[task_name].mode`):
-      * mode == "mc"     → MCRawRow
-      * mode == "schema" → SchemaRawRow
-      * mode == "lm"     → LMRawRow
+      * mode == "mc"     → MCRawRow   ({query, choices, gold})
+      * mode == "schema" → SchemaRawRow ({context_options, continuation, gold})
+      * mode == "lm"     → LMRawRow   ({context, continuation})
 
-    The JSONL schema is the canonical Ralph form documented in
-    `_parse_mc_row` / `_parse_schema_row` / `_parse_lm_row`. If the
-    DCLM bundle's per-task JSONLs use different keys, the
-    downloader / mirror script (separate follow-up) is responsible for
-    re-keying into this canonical schema during the bundle-prep step.
+    Parses the DCLM/OLMES bundle's on-disk key layout directly (see the
+    per-mode parsers); `bundle_dir` may be the flat per-task mirror or the
+    raw upstream bundle root (category subdirs are walked). The parsers
+    also accept the legacy canonical keys for hand-built fixtures.
 
     Args:
-      bundle_dir: directory containing per-task `<task>.jsonl` files.
+      bundle_dir: directory containing per-task `<task>.jsonl` files
+        (flat) or the raw bundle root (nested category subdirs).
       task_name: one of `DCLM_CORE_22_TASKS`.
 
     Raises:
       ValueError if `task_name` is unknown.
-      FileNotFoundError if `{bundle_dir}/{task_name}.jsonl` doesn't exist.
+      FileNotFoundError if the task's JSONL isn't found (flat or recursive).
       ValueError if any row in the JSONL fails per-mode parsing, with a
         message naming the line number and the missing/invalid field.
     """
@@ -467,26 +501,29 @@ def load_task_examples(
             f"unknown task {task_name!r}; not in DCLM_CORE_22_TASKS"
         )
     bundle_dir = Path(bundle_dir)
-    path = bundle_dir / f"{task_name}.jsonl"
+    # A few CORE-22 task names differ from the bundle's on-disk filename stem
+    # (same underlying data; different upstream naming or eval config).
+    file_stem = _BUNDLE_FILE_ALIASES.get(task_name, task_name)
+    path = bundle_dir / f"{file_stem}.jsonl"
     if not path.exists():
         # DCLM bundle layout nests tasks in category subdirs
         # (eval_bundle/eval_data/{category}/{task}.jsonl). Walk the tree
         # so callers can pass either the flat-mirror dir or the raw
         # upstream bundle root and have lookups still resolve.
-        candidates = sorted(bundle_dir.rglob(f"{task_name}.jsonl"))
+        candidates = sorted(bundle_dir.rglob(f"{file_stem}.jsonl"))
         if len(candidates) == 1:
             path = candidates[0]
         elif len(candidates) > 1:
             raise ValueError(
-                f"ambiguous task file location for {task_name!r}: "
-                f"{[str(c) for c in candidates]}. Flatten the bundle "
-                "or pass a more specific bundle_dir."
+                f"ambiguous task file location for {task_name!r} "
+                f"(stem {file_stem!r}): {[str(c) for c in candidates]}. "
+                "Flatten the bundle or pass a more specific bundle_dir."
             )
         else:
             raise FileNotFoundError(
-                f"CORE-22 task file {task_name}.jsonl not found under "
-                f"{bundle_dir} (searched flat + recursive). The bundle "
-                f"download (URL {DCLM_EVAL_BUNDLE_URL}) must place "
+                f"CORE-22 task file {file_stem}.jsonl (task {task_name!r}) "
+                f"not found under {bundle_dir} (searched flat + recursive). "
+                f"The bundle download (URL {DCLM_EVAL_BUNDLE_URL}) must place "
                 f"per-task JSONLs under the supplied bundle_dir."
             )
 

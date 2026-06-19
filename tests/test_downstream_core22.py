@@ -418,6 +418,81 @@ def test_load_task_examples_lm_happy_path(tmp_path):
     assert rows[1].accept_set == (" fox", " Fox")
 
 
+def test_load_task_examples_schema_dclm_format(tmp_path):
+    """The real DCLM/OLMES schema layout — N context_options sharing ONE
+    continuation — parses, broadcasting the continuation across options."""
+    _write_jsonl(tmp_path / "winogrande.jsonl", [
+        {"context_options": ["Sarah was a better surgeon than Maria so Sarah",
+                             "Sarah was a better surgeon than Maria so Maria"],
+         "continuation": "always got the easier cases.",
+         "gold": 1},
+    ])
+    rows = load_task_examples(tmp_path, "winogrande")
+    assert len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, SchemaRawRow)
+    assert len(row.contexts) == 2
+    # shared continuation broadcast to one entry per context option
+    assert row.continuations == ["always got the easier cases."] * 2
+    assert row.gold == 1
+
+
+def test_load_task_examples_lm_dclm_format(tmp_path):
+    """The real DCLM LM layout keys the gold completion `continuation`
+    (not `target`); extra keys like `category` are ignored."""
+    _write_jsonl(tmp_path / "jeopardy_all.jsonl", [
+        {"context": "This planet is the largest", "continuation": "Jupiter",
+         "category": "Science"},
+    ])
+    rows = load_task_examples(tmp_path, "jeopardy")  # alias → jeopardy_all
+    assert len(rows) == 1
+    assert isinstance(rows[0], LMRawRow)
+    assert rows[0].context == "This planet is the largest"
+    assert rows[0].target == "Jupiter"
+    assert rows[0].accept_set == ()
+
+
+def test_load_task_examples_bundle_file_alias(tmp_path):
+    """Task names whose on-disk stem differs (winograd→winograd_wsc,
+    hellaswag_zeroshot→hellaswag) resolve via _BUNDLE_FILE_ALIASES."""
+    _write_jsonl(tmp_path / "winograd_wsc.jsonl", [
+        {"context_options": ["The councilmen refused a permit because the councilmen",
+                             "The councilmen refused a permit because the demonstrators"],
+         "continuation": "feared violence.", "gold": 0},
+    ])
+    rows = load_task_examples(tmp_path, "winograd")
+    assert len(rows) == 1
+    assert isinstance(rows[0], SchemaRawRow)
+
+
+_REAL_BUNDLE = (
+    Path(__file__).resolve().parent.parent
+    / "eval/private/downstream_pool/bundle_v1/eval_bundle/eval_data"
+)
+
+
+@pytest.mark.skipif(
+    not _REAL_BUNDLE.exists(),
+    reason="DCLM eval bundle not present (gitignored; download via "
+    "scripts/download_dclm_bundle.py)",
+)
+def test_load_all_core22_from_real_bundle():
+    """Every CORE-22 task loads from the actual on-disk DCLM bundle.
+
+    Regression guard for the parser/alias fix: before it, the 2 schema +
+    9 lm tasks crashed (wrong field names) and winograd/hellaswag_zeroshot/
+    jeopardy failed file resolution — only the 11 mc tasks loaded.
+    """
+    for task_name in DCLM_CORE_22_TASKS:
+        rows = load_task_examples(_REAL_BUNDLE, task_name)
+        assert len(rows) > 0, f"{task_name}: loaded zero rows"
+        mode = TASK_SPECS[task_name].mode
+        expected = {"mc": MCRawRow, "schema": SchemaRawRow, "lm": LMRawRow}[mode]
+        assert all(isinstance(r, expected) for r in rows), (
+            f"{task_name} (mode={mode}): wrong row type"
+        )
+
+
 def test_load_task_examples_skips_blank_lines(tmp_path):
     """Blank lines in the JSONL are skipped, not parsed as bad JSON."""
     path = tmp_path / "arc_easy.jsonl"
@@ -478,7 +553,7 @@ def test_load_task_examples_lm_missing_context_raises(tmp_path):
     _write_jsonl(tmp_path / "lambada_openai.jsonl", [
         {"id": "l", "target": " time"},  # missing 'context'
     ])
-    with pytest.raises(ValueError, match=r"canonical LM schema"):
+    with pytest.raises(ValueError, match=r"expected LM schema"):
         load_task_examples(tmp_path, "lambada_openai")
 
 
