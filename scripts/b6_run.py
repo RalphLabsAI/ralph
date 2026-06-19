@@ -83,12 +83,16 @@ DEFAULT_BUDGET_CAP_USD = 1200.0
 DEFAULT_PER_RUNG_H100_HR_RATE = 2.0  # Shadeform spot reference
 SEED_RETRY_OFFSET = 1000  # second-attempt seed = primary + 1000
 
-# Standard rungs for B6 — locked to the v0.10 ladder. Each rung
-# carries its dim + n_layers for audit reproducibility.
+# Standard rungs for B6 — a SINGLE S3 rung, matching the validated
+# ρ=0.614 transfer run (experiments/2026-06-transfer-credibility/run_b6_s3.sh).
+# Only the S3 cell feeds the Spearman score vector, so evaluating the same
+# checkpoint at S1/S2/S3 (which differ only by an advisory scale_label —
+# run_ladder_eval re-runs the same checkpoint+patch per rung) is 3× redundant
+# compute. `n_examples_per_task=100` caps per-task eval so the run stays inside
+# the validator time budget — without it, mode-0 evaluates ALL examples (e.g.
+# bigbench_qa_wikidata ≈ 20k rows), which blows the cap.
 _B6_STANDARD_RUNGS: tuple[LadderRungSpec, ...] = (
-    LadderRungSpec(scale_label="S1", dim=256, n_layers=4),
-    LadderRungSpec(scale_label="S2", dim=512, n_layers=12),
-    LadderRungSpec(scale_label="S3", dim=768, n_layers=12),
+    LadderRungSpec(scale_label="S3", dim=768, n_layers=12, n_examples_per_task=100),
 )
 
 
@@ -189,8 +193,8 @@ def estimate_cost(
     """Estimate USD cost of a recipe's wall-clock at the spot rate.
 
     The wall_clock_s is from the run_ladder_eval combined report; it's
-    the max across rungs (per merge_rung_reports), so a 3-rung recipe at
-    S3=300s would produce wall_clock_s ≈ 300s. Multiply by spot rate.
+    the max across rungs (per merge_rung_reports), so the single S3 rung at
+    ≈300s produces wall_clock_s ≈ 300s. Multiply by spot rate.
     """
     h100_hr = wall_clock_s / 3600.0
     return h100_hr * per_rung_h100_hr_rate
