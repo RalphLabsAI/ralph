@@ -399,6 +399,42 @@ def _extract_gpu_jwt(token):
     return token
 
 
+def _all_bundle_jwts(token) -> list[str]:
+    """Recursively collect every JWT string in a get_token() bundle.
+
+    The real NRAS token is NESTED (2026-06-22 CC report, Issue 6):
+        [["JWT", <outer_eat>], {"REMOTE_GPU_CLAIMS": [["JWT", <gpu_eat>], {…}]}]
+    The outer EAT is only an envelope (iss/iat/exp/jti — NO eat_nonce); the real
+    `eat_nonce` + NVIDIA claims live on the inner REMOTE_GPU_CLAIMS submodule EAT.
+    Walk the whole structure (any depth / key names) and return every string that
+    looks like a JWT (header.payload.signature), so the caller can find the layer
+    that actually carries the claim it needs.
+    """
+    import json as _json
+
+    out: list[str] = []
+
+    def walk(x):
+        if isinstance(x, str):
+            s = x.strip()
+            if s.count(".") == 2 and not s.startswith(("[", "{")):
+                out.append(s)
+            elif s.startswith(("[", "{")):
+                try:
+                    walk(_json.loads(s))
+                except Exception:
+                    pass
+        elif isinstance(x, (list, tuple)):
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(token)
+    return out
+
+
 def verify_gpu_token(token: str, expected_nonce: str) -> tuple[bool, str]:
     """Verify an NVIDIA GPU attestation JWT token.
 
@@ -428,11 +464,20 @@ def verify_gpu_token(token: str, expected_nonce: str) -> tuple[bool, str]:
         )
         try:
             import jwt
-            # get_token() returns the detached-EAT bundle; decode the OUTER JWT,
-            # not the whole bundle (fixes "Invalid header string").
-            inner = _extract_gpu_jwt(token)
-            claims = jwt.decode(inner, options={"verify_signature": False})
-            token_nonce = claims.get("eat_nonce", claims.get("nonce", ""))
+            # get_token() returns a NESTED detached-EAT bundle. eat_nonce lives
+            # on the inner REMOTE_GPU_CLAIMS submodule EAT, NOT the outer envelope
+            # (Issue 6). Search every JWT layer for the nonce claim rather than
+            # only decoding the outer one.
+            token_nonce = ""
+            jwts = _all_bundle_jwts(token) or [_extract_gpu_jwt(token)]
+            for _j in jwts:
+                try:
+                    _c = jwt.decode(_j, options={"verify_signature": False})
+                except Exception:
+                    continue
+                token_nonce = _c.get("eat_nonce") or _c.get("nonce") or ""
+                if token_nonce:
+                    break
             # Compare in the SDK's 64-hex form (token claim has no 0x prefix).
             exp = gpu_sdk_nonce(expected_nonce) if expected_nonce else ""
             if exp and gpu_sdk_nonce(token_nonce) != exp:
