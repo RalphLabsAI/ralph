@@ -27,6 +27,20 @@ API_BASE = "https://api.shadeform.ai/v1"
 KEY_FILE = Path("/root/.shadeform_api_key")
 INSTANCE_FILE_PREFIX = "/root/.shadeform_instance_"
 INSTANCE_NAME_PREFIX = "ralph-"
+# Persistent boxes (e.g. the owner validator) rented OUTSIDE this machine have no
+# local state file here, so the unreferenced sweep would treat them as orphans and
+# delete them (this happened to a `ralph-vali` validator box). Any instance whose
+# name contains a substring listed (one per line, '#' comments ok) in this file is
+# PROTECTED from the unreferenced sweep.
+PROTECT_FILE = Path("/root/.shadeform_protect")
+
+
+def _protect_patterns() -> list[str]:
+    try:
+        lines = PROTECT_FILE.read_text().splitlines()
+    except OSError:
+        return []
+    return [s.split("#", 1)[0].strip() for s in lines if s.split("#", 1)[0].strip()]
 
 
 def _api_key() -> str:
@@ -113,6 +127,7 @@ def sweep_unreferenced_ralph_instances() -> int:
     if res is None:
         return 0
     instances = res.get("instances") or []
+    protect = _protect_patterns()
     swept = 0
     for inst in instances:
         iid = inst.get("id")
@@ -123,6 +138,9 @@ def sweep_unreferenced_ralph_instances() -> int:
         if not name.startswith(INSTANCE_NAME_PREFIX):
             continue
         if iid in known_ids:
+            continue
+        if any(pat in name for pat in protect):
+            print(f"[sweep] PROTECTED, skipping {name!r}", file=sys.stderr)
             continue
         if _delete_instance(iid, f"unreferenced ralph-* instance name={name!r}"):
             swept += 1
