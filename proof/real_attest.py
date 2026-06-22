@@ -152,6 +152,64 @@ def gpu_sdk_nonce(nonce: str) -> str:
     return n.lower()
 
 
+def build_user_data(
+    container_measurement: str,
+    rolling_log_hash: str,
+    handshake_nonce: str,
+    bundle_hash: Optional[str] = None,
+) -> str:
+    """Canonical TDX user_data string bound into the quote's report_data.
+
+    report_data = sha256(handshake_nonce + user_data). Mid-epoch quotes use
+    `cm:rolling:nonce`; the FINAL epoch appends `:bundle_hash`. SINGLE SOURCE OF
+    TRUTH for both generation (`_get_tdx_quote` callers) and verification
+    (`verify_tdx_quote` rebuilds it byte-identically to check the binding) — if
+    these two ever drift, the binding silently breaks. Do not inline this string.
+    """
+    base = f"{container_measurement}:{rolling_log_hash}:{handshake_nonce}"
+    return f"{base}:{bundle_hash}" if bundle_hash is not None else base
+
+
+def parse_nras_bundle(token) -> tuple[Optional[str], list[str]]:
+    """Parse the nv-attestation-sdk get_token() value into (outer_eat, gpu_eats).
+
+    The real NRAS token is NESTED (2026-06-22 CC report, Issue 6):
+        [["JWT", <outer_eat>], {"REMOTE_GPU_CLAIMS": [["JWT", <gpu_eat>], {…}]}]
+    The OUTER EAT is an envelope (iss/iat/exp/jti — no per-device claims); the
+    real attestation claims (eat_nonce, x-nvidia-overall-att-result, submods, …)
+    live on the GPU submodule EAT(s). Returns (outer_jwt_or_None, [gpu_eat_jwt…]).
+    Robust to a bare JWT (→ ([], [token])-ish) and a JSON-string bundle.
+    """
+    import json as _json
+
+    val = token
+    if isinstance(val, str):
+        s = val.strip()
+        if s.count(".") == 2 and not s.startswith(("[", "{")):
+            return None, [s]  # bare JWT — treat as the only EAT
+        try:
+            val = _json.loads(s)
+        except Exception:
+            return None, []
+    outer: Optional[str] = None
+    gpu_eats: list[str] = []
+    if isinstance(val, (list, tuple)) and val:
+        head = val[0]
+        if isinstance(head, (list, tuple)) and len(head) >= 2 and isinstance(head[1], str):
+            outer = head[1]
+        # submodules: val[1] is a dict {name: <nested bundle | jwt>}
+        if len(val) >= 2 and isinstance(val[1], dict):
+            for sub in val[1].values():
+                # sub is itself [["JWT", gpu_eat], {…}] OR a bare jwt str
+                if isinstance(sub, (list, tuple)) and sub and \
+                        isinstance(sub[0], (list, tuple)) and len(sub[0]) >= 2 \
+                        and isinstance(sub[0][1], str):
+                    gpu_eats.append(sub[0][1])
+                elif isinstance(sub, str) and sub.count(".") == 2:
+                    gpu_eats.append(sub)
+    return outer, gpu_eats
+
+
 def _get_gpu_evidence(nonce: str) -> tuple[Optional[str], Optional[str]]:
     """Generate NVIDIA GPU attestation evidence + verify via NRAS.
 
@@ -283,7 +341,7 @@ def generate_attestation(
     )
 
     for (epoch_idx, ts, rolling_hash) in epoch_records:
-        user_data = f"{container_measurement}:{rolling_hash}:{handshake_nonce}"
+        user_data = build_user_data(container_measurement, rolling_hash, handshake_nonce)
         epoch = AttestationEpoch(
             epoch=epoch_idx,
             timestamp=ts,
@@ -327,7 +385,7 @@ def generate_attestation(
         last_epoch = 0
         last_rolling = hashlib.sha256(bundle_hash.encode()).hexdigest()
 
-    final_user_data = f"{container_measurement}:{last_rolling}:{handshake_nonce}:{bundle_hash}"
+    final_user_data = build_user_data(container_measurement, last_rolling, handshake_nonce, bundle_hash)
     final_epoch = AttestationEpoch(
         epoch=last_epoch,
         timestamp=last_ts,
@@ -504,26 +562,45 @@ def verify_gpu_token(token: str, expected_nonce: str) -> tuple[bool, str]:
     )
 
 
-def verify_tdx_quote(quote_hex: str, expected_nonce: str, expected_measurement: str) -> tuple[bool, str]:
-    """Verify an Intel TDX quote.
+def verify_tdx_quote(
+    quote_hex: str,
+    expected_nonce: str,
+    expected_user_data: str,
+    measurement_allowlist: Optional[list] = None,
+) -> tuple[bool, str]:
+    """Verify an Intel TDX quote (Part B).
 
-    Fail-closed implementation (deep_review_2026-05-31 #3): the previous
-    code only checked len(quote) >= 256, never verified the Intel signature
-    chain, never checked RTMRs against expected_measurement, never checked
-    report_data == sha256(nonce || user_data). Any 256-byte blob passed.
+    SIGNATURE FIX (the real bug): the prior 3-arg form took
+    `expected_measurement` and fed it the container_measurement — a category
+    error: a sha256 over source files is NOT in the TD's MRTD/RTMRs. The actual
+    binding is `report_data == sha256(expected_nonce + expected_user_data)`, so
+    this needs `expected_user_data` (rebuilt by the caller via `build_user_data`,
+    byte-identical to the miner's `_get_tdx_quote`).
 
-    Until libtdx-attest / trustauthority-py is wired in, this function
-    REFUSES TDX quote acceptance. Set RALPH_ALLOW_REAL_ATTEST_STUB=1 to
-    re-enable the loose check on testnet only.
+    Full verification (finalized against captured CC fixtures + dcap-qvl):
+      1. Intel DCAP signature chain to the PINNED Intel SGX Root CA + TCB status.
+      2. report_data[:32] == sha256(expected_nonce + expected_user_data); tail 0.
+      3. MRTD/RTMRs present in `measurement_allowlist` (proof/cc_allowlist.yaml).
+
+    STATUS: the DCAP signature-chain + structured report_data extraction need the
+    `dcap-qvl` lib + the pinned Intel root + real-quote validation — pending the
+    miner's 10 fixtures. Until then the PRODUCTION path FAIL-CLOSES. The testnet
+    stub (RALPH_ALLOW_REAL_ATTEST_STUB=1) now ALSO checks the report_data binding
+    (best-effort: the expected digest must appear in the quote), so a quote from
+    a different submission / nonce is rejected even in stub mode.
     """
+    import hashlib as _hl
     import os as _os
+
     if not quote_hex:
         return False, "empty TDX quote"
+    expected_rd = _hl.sha256((expected_nonce + expected_user_data).encode()).digest()  # 32 bytes
+
     if _os.environ.get("RALPH_ALLOW_REAL_ATTEST_STUB") == "1":
         import sys as _sys
         print(
-            "[attest] WARNING: RALPH_ALLOW_REAL_ATTEST_STUB=1 — accepting "
-            "TDX quote without Intel signature chain verification. "
+            "[attest] WARNING: RALPH_ALLOW_REAL_ATTEST_STUB=1 — accepting TDX "
+            "quote without Intel signature-chain / RTMR verification. "
             "MUST NOT BE SET ON MAINNET.",
             file=_sys.stderr,
         )
@@ -533,13 +610,21 @@ def verify_tdx_quote(quote_hex: str, expected_nonce: str, expected_measurement: 
             return False, f"TDX quote hex decode failed: {e}"
         if len(quote_bytes) < 256:
             return False, f"TDX quote too short ({len(quote_bytes)} bytes)"
-        return True, f"TDX quote accepted (stub: signature/RTMR/report_data unchecked, {len(quote_bytes)} bytes)"
+        # Binding check works even in stub mode: the miner writes
+        # report_data = sha256(nonce+user_data) into the quote, so the 32-byte
+        # digest must appear. Catches a replayed/cross-submission quote.
+        if expected_rd not in quote_bytes:
+            return False, "report_data binding failed (nonce/user_data not in TDX quote)"
+        return True, (
+            f"TDX quote accepted (stub: sig/RTMR unchecked; report_data BOUND, "
+            f"{len(quote_bytes)} bytes)"
+        )
 
     return False, (
-        "TDX quote verification not implemented. Wire libtdx-attest or "
-        "trustauthority-py to check Intel signature chain, RTMRs against "
-        "expected_measurement, and report_data == sha256(nonce||user_data). "
-        "Or set RALPH_ALLOW_REAL_ATTEST_STUB=1 (testnet only)."
+        "TDX quote verification not implemented (Part B). Wire dcap-qvl: verify "
+        "the Intel signature chain to the pinned SGX root + TCB status, check "
+        "report_data[:32] == sha256(nonce||user_data), and MRTD/RTMRs against the "
+        "allowlist. Or set RALPH_ALLOW_REAL_ATTEST_STUB=1 (testnet only)."
     )
 
 
@@ -642,9 +727,18 @@ def verify_attestation(
                     f"epoch {i}: missing Intel TDX (TEE) quote (required at level tdx_nvcc)"
                 )
         else:
+            # Rebuild THIS epoch's user_data byte-identically to the miner
+            # (build_user_data is the single source of truth). The final epoch
+            # appends the bundle_hash; mid epochs don't. report_data binds to it.
+            is_final = i == len(att.epochs) - 1
+            exp_user_data = build_user_data(
+                ep.container_measurement,
+                ep.rolling_log_hash,
+                expected_handshake_nonce,
+                bundle_hash=expected_bundle_hash if is_final else None,
+            )
             ok, detail = verify_tdx_quote(
-                ep.tdx_quote, expected_handshake_nonce,
-                expected_container_measurement,
+                ep.tdx_quote, expected_handshake_nonce, exp_user_data,
             )
             if not ok:
                 errors.append(f"epoch {i}: {detail}")
