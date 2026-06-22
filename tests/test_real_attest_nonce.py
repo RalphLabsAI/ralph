@@ -98,3 +98,37 @@ def test_stub_accepts_real_get_token_bundle(monkeypatch):
     bundle = _json.dumps([["JWT", outer], {"GPU-0": outer}])  # nv-sdk shape
     ok, detail = RA.verify_gpu_token(bundle, onchain)
     assert ok, detail
+
+
+def test_all_bundle_jwts_collects_nested():
+    """Issue 6: the real NRAS token nests the GPU EAT under REMOTE_GPU_CLAIMS."""
+    import json as _json
+
+    nested = [["JWT", "outer.env.sig"],
+              {"REMOTE_GPU_CLAIMS": [["JWT", "gpu.claims.sig"], {}]}]
+    got = RA._all_bundle_jwts(nested)
+    assert "outer.env.sig" in got and "gpu.claims.sig" in got
+    # also works from a JSON string
+    assert set(RA._all_bundle_jwts(_json.dumps(nested))) == {"outer.env.sig", "gpu.claims.sig"}
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("jwt") is None, reason="PyJWT not installed"
+)
+def test_stub_finds_eat_nonce_on_nested_gpu_submodule(monkeypatch):
+    """Issue 6 regression: eat_nonce is on the inner REMOTE_GPU_CLAIMS EAT, NOT
+    the outer envelope. The stub must search the nested layer."""
+    import json as _json
+
+    import jwt
+
+    monkeypatch.setenv("RALPH_ALLOW_REAL_ATTEST_STUB", "1")
+    bare = "2fcc0dbc" * 8  # 64 hex
+    onchain = "0x" + bare
+    # outer envelope has NO eat_nonce (just iss/exp/jti) — like the real token
+    outer = jwt.encode({"iss": "NRAS", "exp": 9999999999, "jti": "x"}, "s", algorithm="HS256")
+    gpu_eat = jwt.encode({"sub": "...", "eat_nonce": bare,
+                          "x-nvidia-overall-att-result": True}, "s", algorithm="HS256")
+    bundle = _json.dumps([["JWT", outer], {"REMOTE_GPU_CLAIMS": [["JWT", gpu_eat], {}]}])
+    ok, detail = RA.verify_gpu_token(bundle, onchain)
+    assert ok, detail
