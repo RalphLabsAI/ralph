@@ -583,18 +583,20 @@ def run_epoch(
     if recovered:
         log_info(f"recovered {len(recovered)} pending weights from previous epoch")
 
+    # NOTE: do NOT early-burn on an empty epoch. A king-based subnet must keep
+    # weighting the SITTING king until someone dethrones it — burning idle
+    # epochs would starve the reigning king and is exactly the behavior miners /
+    # validators distrust. We fall through to the normal end-of-epoch weight
+    # block: with zero bundles the scoring loop no-ops, _apply_pool_split()
+    # re-asserts the sitting king (king → 1.0), and the BURN fallback there
+    # fires ONLY when there is genuinely nothing to weight — i.e. NO king at all
+    # (genesis, or right after the king is reset).
     if not bundles and not recovered:
-        # Zero submissions this epoch — the validator would otherwise set no
-        # weights at all. BURN FALLBACK: still set weights to uid 0 so it keeps
-        # its vTrust alive + burns to the owner (standard). Best-effort; the
-        # chain's rate-limit guard skips it when set too often.
-        if _burn_fallback_enabled():
-            log_info("no pending submissions this epoch — setting BURN weights (uid 0)")
-            try:
-                chain.set_burn_weights()
-            except Exception as e:
-                log_warn(f"burn fallback failed (non-fatal): {e}")
-        return {"submissions": 0, "accepted": 0, "rejected": 0}
+        king = chain.get_king()
+        if king is not None:
+            log_info(f"no new submissions — holding king {king.miner_hotkey[:12]}… (weights below)")
+        else:
+            log_info("no submissions and no king yet — burning to uid 0 (genesis)")
 
     log_info(f"found {len(bundles)} pending submission(s)")
     epoch_results = {"submissions": len(bundles), "accepted": 0, "rejected": 0}
