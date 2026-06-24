@@ -191,14 +191,28 @@ def _close_losing_prs(bundle_dir: Path, reason: str) -> None:
         log_warn(f"GitHub PR close skipped for {bundle_dir.name}: {e}")
 
 
+def _require_gh_pr() -> bool:
+    """Policy: every submission must carry a GitHub recipe PR. Opt out (e.g.
+    testnet) with RALPH_REQUIRE_GH_PR=0."""
+    return os.environ.get("RALPH_REQUIRE_GH_PR", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _verify_pr_if_required(result, bundle_dir: Path) -> tuple[bool, str]:
-    """If $RALPH_BOT_GH_TOKEN is set and the submission carries a pr_url,
-    verify the PR's diff is byte-equal to the bundle's patch.diff.
-    Returns (ok, detail). If verification isn't configured, returns (True, "").
+    """A submission MUST carry a valid GitHub recipe PR:
+      - empty pr_url  → REJECT (no recipe PR), unless RALPH_REQUIRE_GH_PR=0.
+      - pr_url + bot token → the PR's diff must be byte-equal to the bundle's
+        patch.diff (verified), else REJECT.
+      - pr_url but no bot token → can't verify the diff; allowed (operator must
+        set RALPH_BOT_GH_TOKEN to enforce the match).
+    Returns (ok, detail).
     """
-    token = os.environ.get("RALPH_BOT_GH_TOKEN", "")
-    if not token or not result.pr_url:
+    if not result.pr_url:
+        if _require_gh_pr():
+            return False, "no GitHub recipe PR (pr_url empty) — a recipe PR is required"
         return True, ""
+    token = os.environ.get("RALPH_BOT_GH_TOKEN", "")
+    if not token:
+        return True, "pr_url present but no bot token to verify the diff — skipping match"
     patch_path = bundle_dir / "patch.diff"
     if not patch_path.exists():
         return True, "no patch.diff in bundle (baseline?) — skipping PR match"
@@ -347,7 +361,7 @@ def score_and_decide(
             "miner_hotkey": result.miner_hotkey,
             "miner_github": result.miner_github,
             "pr_url": result.pr_url,
-            "reason": "pr_mismatch",
+            "reason": "invalid_recipe_pr",
             "detail": pr_detail,
         }
 
