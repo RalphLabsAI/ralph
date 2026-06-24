@@ -44,6 +44,7 @@ import ralph_bootstrap  # noqa: F401  — injects RALPH_RECIPE_DIR onto sys.path
 from chain_layer.config import get_chain
 from validator.hf_poller import DEFAULT_REPO as DEFAULT_HF_REPO
 from validator.hf_poller import poll_hub
+from validator import telemetry
 from validator.scoring import score_bundle
 from validator.validator import judge_submission
 
@@ -1167,11 +1168,14 @@ def main():
     log_info(f"submit bundles to: {args.queue_dir / 'pending' / '<bundle_id>/'}")
     log_info("")
 
+    telemetry.init(netuid=int(os.environ.get("BT_NETUID", "40")), epoch_seconds=args.epoch_seconds)
+
     epoch = 0
     while not SHUTDOWN:
         epoch += 1
         log_info(f"--- epoch {epoch} ---")
 
+        result = {"submissions": 0, "accepted": 0, "rejected": 0}
         try:
             result = run_epoch(
                 chain,
@@ -1203,6 +1207,8 @@ def main():
                 pass
             _log_validator_standing(chain)
 
+        telemetry.log_epoch(chain, epoch, result)
+
         if args.once:
             break
 
@@ -1212,6 +1218,7 @@ def main():
                 break
             time.sleep(1)
 
+    telemetry.finish()
     log_info("validator service stopped")
 
 
