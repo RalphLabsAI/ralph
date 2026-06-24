@@ -3,9 +3,9 @@
 king earns at least one weight cycle. Challengers inside the tenure are deferred
 (left pending, not crowned, not archived)."""
 
+import validator.service as service
 from chain_layer.interface import KingRecord
 from chain_layer.local import LocalChain
-import validator.service as service
 
 
 def _king(block, hk="5KINGold"):
