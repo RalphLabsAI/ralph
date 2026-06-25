@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model import RalphBase, RalphConfig
 
-from eval import HiddenEvalResult, run_hidden_eval
+from eval import HiddenEvalResult
 from miner.submit import lookup_handshake, verify_signature
 from proof.mock_attest import (
     MockAttestation,
@@ -535,7 +535,6 @@ def _patched_hidden_eval(
     don't need to branch on the path.
     """
     import shutil
-    import subprocess
     import tempfile
 
     from proof.runner import apply_patch
