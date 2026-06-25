@@ -535,24 +535,41 @@ def _require_merged_king_pr() -> bool:
     return os.environ.get("RALPH_REQUIRE_MERGED_KING_PR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# A merged PR is immutable, so confirmed-merged pr_urls are cached and never
+# re-hit the GitHub API. Only TRUE is cached: a not-yet-merged PR is re-checked,
+# while a transient GitHub outage on an ALREADY-merged king returns the cached
+# True instead of a fail-closed False (which would burn a legitimate king).
+_MERGED_PR_URLS: set[str] = set()
+
+
 def _king_record_pr_merged(king) -> bool:
     """True iff the given king record's recipe PR is merged.
 
     Reads pr_url from the king's proof_dir/submission.json and checks GitHub
-    with RALPH_BOT_GH_TOKEN. Fail closed: a missing king / pr_url / token, or any
-    API error, returns False so an unverifiable king is never treated as valid.
+    with RALPH_BOT_GH_TOKEN. Fail closed: a missing king / proof_dir / pr_url /
+    token, or any API error, returns False so an unverifiable king is never
+    treated as valid. Confirmed-merged pr_urls are cached (merge is immutable),
+    so GitHub flakiness can't burn a king that was already verified merged.
     """
     if king is None:
         return False
-    sub_path = Path(getattr(king, "proof_dir", "") or "") / "submission.json"
+    proof_dir = getattr(king, "proof_dir", "") or ""
+    if not proof_dir:
+        return False  # guard: never read a relative ./submission.json
     try:
-        pr_url = json.loads(sub_path.read_text(encoding="utf-8", errors="replace")).get("pr_url", "")
+        sub = json.loads((Path(proof_dir) / "submission.json").read_text(encoding="utf-8", errors="replace"))
+        pr_url = sub.get("pr_url", "")
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         pr_url = ""
     if not pr_url:
         return False
+    if pr_url in _MERGED_PR_URLS:
+        return True
     from validator.github_bot import pr_is_merged
-    return pr_is_merged(pr_url, os.environ.get("RALPH_BOT_GH_TOKEN", ""))
+    merged = pr_is_merged(pr_url, os.environ.get("RALPH_BOT_GH_TOKEN", ""))
+    if merged:
+        _MERGED_PR_URLS.add(pr_url)
+    return merged
 
 
 def _king_pr_merged(chain) -> bool:
@@ -580,10 +597,11 @@ def _reinstate_valid_king(chain) -> None:
         from chain_layer.interface import KingRecord
         node = king
         while isinstance(node.previous_king, dict):
-            try:
-                node = KingRecord(**node.previous_king)
-            except TypeError:
-                break
+            # KingRecord.from_dict (not **) so a record serialized with
+            # compute_cost_h100h or unknown keys reconstructs instead of raising
+            # TypeError — which previously cleared the throne even when a valid
+            # merged ancestor existed below.
+            node = KingRecord.from_dict(node.previous_king)
             if _king_record_pr_merged(node):
                 log_warn(
                     f"sitting king {king.miner_hotkey[:12]}… has no merged recipe PR "
@@ -593,15 +611,11 @@ def _reinstate_valid_king(chain) -> None:
                 return
         # No ancestor has a merged PR: clear the throne so the next legitimately
         # merged submission is crowned (until then run_epoch burns).
-        chain_dir = getattr(chain, "chain_dir", None)
-        if chain_dir:
-            king_path = Path(chain_dir) / "king.json"
-            if king_path.exists():
-                king_path.unlink()
-                log_warn(
-                    f"sitting king {king.miner_hotkey[:12]}… has no merged recipe PR "
-                    f"and no valid ancestor — throne cleared (burning until a valid king)"
-                )
+        chain.clear_king()
+        log_warn(
+            f"sitting king {king.miner_hotkey[:12]}… has no merged recipe PR and no "
+            f"valid ancestor — throne cleared (burning until a valid king)"
+        )
     except Exception as e:
         log_warn(f"king reinstatement check failed (throne unchanged): {e}")
 
