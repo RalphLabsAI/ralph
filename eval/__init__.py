@@ -17,10 +17,20 @@ from .sealed_streams import (
     select_active_streams,
     write_manifest,
 )
-from .val_bpb import DEFAULT_BYTES_PER_TOKEN, compute_val_bpb, compute_val_bpb_on_stream
+from .val_bpb import (
+    DEFAULT_BYTES_PER_TOKEN,
+    EVAL_SEQ_LEN,
+    NonCausalModelError,
+    assert_causal,
+    compute_val_bpb,
+    compute_val_bpb_on_stream,
+)
 
 __all__ = [
     "DEFAULT_BYTES_PER_TOKEN",
+    "EVAL_SEQ_LEN",
+    "NonCausalModelError",
+    "assert_causal",
     "HiddenEvalResult",
     "MANIFEST_VERSION",
     "SealedStreamBatch",

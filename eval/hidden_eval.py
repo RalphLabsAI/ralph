@@ -21,7 +21,7 @@ import torch
 
 from .benchmark import compute_benchmark_score, make_placeholder_examples
 from .downstream.types import DownstreamReport
-from .val_bpb import compute_val_bpb, load_eval_tokens
+from .val_bpb import assert_causal, compute_val_bpb, load_eval_tokens
 
 
 @dataclass
@@ -132,6 +132,11 @@ def run_hidden_eval(
         # so the smoke test runs without a pre-built eval shard.
         rng = np.random.default_rng(424242)
         eval_tokens = rng.integers(0, 50257, size=4096, dtype=np.uint16)
+
+    # The validator scores the miner's OWN forward() to compute val_bpb. Reject a
+    # non-causal forward that peeks at the next token (the answer for position t is
+    # input[t+1]) before trusting any score — otherwise val_bpb can be driven to ~0.
+    assert_causal(model, np.asarray(eval_tokens), seq_len=seq_len)
 
     bpb_result = compute_val_bpb(
         model,

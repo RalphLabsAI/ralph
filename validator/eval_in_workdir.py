@@ -102,8 +102,12 @@ def main() -> int:
         model = model.cuda()
 
     try:
+        from eval import EVAL_SEQ_LEN
         eval_root = workdir if (workdir / "eval" / "private").is_dir() else ralph_root
-        result = run_hidden_eval(model, eval_root / "eval" / "private", seq_len=cfg.max_seq_len // 2)
+        # Pin the eval window validator-side (see op4_hidden_eval) — not the
+        # miner-controlled cfg.max_seq_len.
+        eval_seq_len = min(EVAL_SEQ_LEN, cfg.max_seq_len)
+        result = run_hidden_eval(model, eval_root / "eval" / "private", seq_len=eval_seq_len)
     except Exception as e:
         print(f"ERROR: hidden_eval crashed: {e}", file=sys.stderr)
         return 2

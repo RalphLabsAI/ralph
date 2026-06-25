@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model import RalphBase, RalphConfig
 
-from eval import HiddenEvalResult, run_hidden_eval
+from eval import EVAL_SEQ_LEN, HiddenEvalResult, run_hidden_eval
 from miner.submit import lookup_handshake, verify_signature
 from proof.mock_attest import (
     MockAttestation,
@@ -587,7 +587,11 @@ def op4_hidden_eval(
         raise
     if torch.cuda.is_available():
         model = model.cuda()
-    result = run_hidden_eval(model, ralph_root / "eval" / "private", seq_len=cfg.max_seq_len // 2)
+    # Pin the eval window validator-side. Using cfg.max_seq_len (miner-controlled)
+    # would let a miner enlarge the eval context to score an easier eval than the
+    # king. Cap at the model's max_seq_len so small-context models still load.
+    eval_seq_len = min(EVAL_SEQ_LEN, cfg.max_seq_len)
+    result = run_hidden_eval(model, ralph_root / "eval" / "private", seq_len=eval_seq_len)
     return True, f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f}", result
 
 

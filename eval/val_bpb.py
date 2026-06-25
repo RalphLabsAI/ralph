@@ -39,6 +39,82 @@ if TYPE_CHECKING:
 # and for Phase 0 smoke tests that don't construct a sealed pool.
 DEFAULT_BYTES_PER_TOKEN = 4.0
 
+# Validator-pinned eval window. The hidden eval must NOT use a sequence length
+# derived from the miner's checkpoint config (cfg.max_seq_len // 2): a miner can
+# enlarge it to score against an easier, longer-context eval than the king used.
+# Callers cap with min(EVAL_SEQ_LEN, cfg.max_seq_len) so small-context models
+# still load, but no miner can choose a window larger than the validator's.
+EVAL_SEQ_LEN = 512
+
+
+class NonCausalModelError(RuntimeError):
+    """A model's logits at position t depend on tokens AFTER t.
+
+    The validator runs the miner's own forward() to compute val_bpb. compute_val_bpb
+    feeds the model the whole window in one call, and the target for position t is
+    just input[t+1] — so a NON-causal forward can read the answer and emit a perfect
+    prediction, collapsing val_bpb to ~0 (an unbeatable, fraudulent king). Honest
+    causal LMs are invariant to future tokens; this error rejects ones that aren't.
+    """
+
+
+def assert_causal(
+    model: torch.nn.Module,
+    eval_tokens: np.ndarray,
+    seq_len: int,
+    device: torch.device | None = None,
+    n_probes: int = 4,
+    atol: float = 1e-3,
+) -> None:
+    """Reject a model whose logits at position t depend on tokens after t.
+
+    Defeats the look-ahead exploit (the validator scores the miner's own
+    forward(), and the answer for position t — input[t+1] — sits inside the
+    model's input). For several interior split points k, we copy a real eval
+    window and overwrite the FUTURE positions [k+1:] with a DIFFERENT real
+    held-out slice, then check the logits at positions [:k+1] are unchanged.
+
+    Using a *real, different* future (not uniform-random noise) is deliberate:
+    a random future is trivially distinguishable from real text, which would let
+    an adaptive cheat behave causally during the probe and look ahead only on the
+    real eval. A realistic-but-different future closes that evasion — a causal
+    model is still invariant, a look-ahead one is not.
+
+    No-op when the stream is too short to build a base + decoy window (the caller
+    deploys the real held-out shard in production). Raises NonCausalModelError on
+    failure; the caller treats that as a rejected submission.
+
+    `atol` is generous on purpose: an honest causal model's prefix logits are
+    invariant to future tokens by construction (so the difference is ~0), while a
+    look-ahead cheat must move logits by a large margin to drive val_bpb toward 0.
+    The wide gap means a loose tolerance keeps detection certain yet leaves no room
+    for a false positive from GPU/bf16 attention-kernel tiling noise.
+    """
+    eval_tokens = np.asarray(eval_tokens)
+    if seq_len < 2 or len(eval_tokens) < 2 * (seq_len + 1):
+        return
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+    base = torch.from_numpy(eval_tokens[:seq_len].astype(np.int64))[None].to(device)
+    decoy = torch.from_numpy(eval_tokens[seq_len : 2 * seq_len].astype(np.int64))[None].to(device)
+    with torch.no_grad():
+        base_logits, _ = model(base)
+        for i in range(1, n_probes + 1):
+            k = (seq_len * i) // (n_probes + 1)  # interior split points
+            if k < 1 or k >= seq_len - 1:
+                continue
+            if torch.equal(base[:, k + 1 :], decoy[:, k + 1 :]):
+                continue  # identical tail (degenerate stream) — this k proves nothing
+            alt = base.clone()
+            alt[:, k + 1 :] = decoy[:, k + 1 :]  # realistic, different future
+            alt_logits, _ = model(alt)
+            if not torch.allclose(base_logits[:, : k + 1], alt_logits[:, : k + 1], atol=atol):
+                raise NonCausalModelError(
+                    f"logits at positions <= {k} changed when future tokens were "
+                    f"altered — non-causal forward(); val_bpb is untrustworthy, rejected"
+                )
+
 
 def compute_val_bpb(
     model: torch.nn.Module,
