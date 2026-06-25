@@ -429,6 +429,98 @@ def _is_state_dict_shape_mismatch(err: Exception) -> bool:
     )
 
 
+def _run_eval_subprocess(
+    workdir: Path,
+    ckpt_path: Path,
+    ralph_root: Path,
+    label: str,
+) -> tuple[bool, str, HiddenEvalResult | None]:
+    """Run eval_in_workdir.py in a subprocess and parse its result.
+
+    Isolates the checkpoint build + load + forward in a child process so a fatal
+    CUDA fault (illegal memory access, device-side assert) or a hang kills ONLY
+    the child. The caller gets (False, reason, None) and can reject the bundle
+    instead of the whole validator process aborting — a C++ CUDA abort cannot be
+    caught in-process. `workdir` supplies the `model/` package the child imports
+    (canonical RECIPE_DIR or a patched copy); `label` prefixes failure messages.
+    """
+    import subprocess
+
+    helper = Path(__file__).resolve().parent / "eval_in_workdir.py"
+    if not helper.exists():
+        return False, f"{label}: helper script missing at {helper}", None
+    try:
+        res = subprocess.run(
+            [sys.executable, str(helper), str(workdir), str(ckpt_path), str(ralph_root)],
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{label} subprocess timed out (>240s)", None
+    if res.returncode != 0:
+        tail = (res.stderr or "")[-300:]
+        return False, f"{label} subprocess exit={res.returncode}: {tail}", None
+
+    marker = "RALPH_EVAL_RESULT "
+    line = next(
+        (ln for ln in (res.stdout or "").splitlines() if ln.startswith(marker)),
+        None,
+    )
+    if line is None:
+        return False, f"{label}: no RALPH_EVAL_RESULT line in stdout", None
+
+    fields: dict[str, str] = {}
+    for tok in line[len(marker):].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+    required = ("val_bpb", "benchmark_acc", "tokens_evaluated", "benchmark_examples", "eval_set_hash")
+    if not all(k in fields for k in required):
+        return False, f"{label}: malformed result line: {line!r}", None
+
+    def _opt_float(key: str) -> float | None:
+        v = fields.get(key)
+        if v is None or v == "none":
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    def _opt_int(key: str) -> int | None:
+        v = fields.get(key)
+        if v is None or v == "none":
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    def _opt_str(key: str) -> str | None:
+        v = fields.get(key)
+        return None if (v is None or v == "none") else v
+
+    try:
+        result = HiddenEvalResult(
+            val_bpb=float(fields["val_bpb"]),
+            benchmark_accuracy=float(fields["benchmark_acc"]),
+            tokens_evaluated=int(fields["tokens_evaluated"]),
+            benchmark_examples=int(fields["benchmark_examples"]),
+            eval_set_hash=fields["eval_set_hash"],
+            val_seq_len=_opt_int("val_seq_len"),
+            sealed_stream_manifest_hash=_opt_str("sealed_stream_manifest_hash"),
+            tail_val_bpb=_opt_float("tail_val_bpb"),
+        )
+    except ValueError as e:
+        return False, f"{label}: result line parse error: {e}", None
+    return (
+        True,
+        f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f} ({label})",
+        result,
+    )
+
+
 def _patched_hidden_eval(
     ralph_root: Path,
     proof_dir: Path,
@@ -476,83 +568,7 @@ def _patched_hidden_eval(
         except Exception as e:
             return False, f"patched-eval: patch apply failed: {str(e)[:200]}", None
 
-        helper = Path(__file__).resolve().parent / "eval_in_workdir.py"
-        if not helper.exists():
-            return False, f"patched-eval: helper script missing at {helper}", None
-
-        try:
-            res = subprocess.run(
-                [sys.executable, str(helper), str(workdir), str(ckpt_path), str(ralph_root)],
-                capture_output=True,
-                text=True,
-                timeout=240,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "patched-eval subprocess timed out (>240s)", None
-        if res.returncode != 0:
-            tail = (res.stderr or "")[-300:]
-            return False, f"patched-eval subprocess exit={res.returncode}: {tail}", None
-
-        marker = "RALPH_EVAL_RESULT "
-        line = next(
-            (ln for ln in (res.stdout or "").splitlines() if ln.startswith(marker)),
-            None,
-        )
-        if line is None:
-            return False, "patched-eval: no RALPH_EVAL_RESULT line in stdout", None
-
-        fields: dict[str, str] = {}
-        for tok in line[len(marker):].split():
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                fields[k] = v
-        required = ("val_bpb", "benchmark_acc", "tokens_evaluated", "benchmark_examples", "eval_set_hash")
-        if not all(k in fields for k in required):
-            return False, f"patched-eval: malformed result line: {line!r}", None
-
-        # Optional audit-reproducibility fields (validation-v2 Phase 1). Older
-        # helper versions don't emit them; "none" maps to None. Parse
-        # defensively so a malformed optional field never fails the eval.
-        def _opt_float(key: str) -> float | None:
-            v = fields.get(key)
-            if v is None or v == "none":
-                return None
-            try:
-                return float(v)
-            except ValueError:
-                return None
-
-        def _opt_int(key: str) -> int | None:
-            v = fields.get(key)
-            if v is None or v == "none":
-                return None
-            try:
-                return int(v)
-            except ValueError:
-                return None
-
-        def _opt_str(key: str) -> str | None:
-            v = fields.get(key)
-            return None if (v is None or v == "none") else v
-
-        try:
-            result = HiddenEvalResult(
-                val_bpb=float(fields["val_bpb"]),
-                benchmark_accuracy=float(fields["benchmark_acc"]),
-                tokens_evaluated=int(fields["tokens_evaluated"]),
-                benchmark_examples=int(fields["benchmark_examples"]),
-                eval_set_hash=fields["eval_set_hash"],
-                val_seq_len=_opt_int("val_seq_len"),
-                sealed_stream_manifest_hash=_opt_str("sealed_stream_manifest_hash"),
-                tail_val_bpb=_opt_float("tail_val_bpb"),
-            )
-        except ValueError as e:
-            return False, f"patched-eval: result line parse error: {e}", None
-        return (
-            True,
-            f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f} (patched-eval)",
-            result,
-        )
+        return _run_eval_subprocess(workdir, ckpt_path, ralph_root, "patched-eval")
 
 
 def op4_hidden_eval(
@@ -585,10 +601,19 @@ def op4_hidden_eval(
         if _is_state_dict_shape_mismatch(e):
             return _patched_hidden_eval(ralph_root, proof_dir, ckpt_path)
         raise
-    if torch.cuda.is_available():
-        model = model.cuda()
-    result = run_hidden_eval(model, ralph_root / "eval" / "private", seq_len=cfg.max_seq_len // 2)
-    return True, f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f}", result
+    # Canonical checkpoint loads cleanly (the CPU load above only routes a shape
+    # mismatch to _patched_hidden_eval). Run the eval — model build + GPU forward —
+    # in a SUBPROCESS so a fatal CUDA fault in the checkpoint's forward (e.g. an
+    # illegal memory access) kills only the child; the validator then rejects the
+    # bundle instead of the whole process aborting (a C++ CUDA abort can't be
+    # caught in-process). The canonical recipe dir supplies the model/ package;
+    # eval data is read from ralph_root/eval/private inside the child.
+    del model
+    try:
+        from ralph_bootstrap import RECIPE_DIR
+    except Exception as e:
+        return False, f"canonical-eval setup: bootstrap import failed: {e}", None
+    return _run_eval_subprocess(RECIPE_DIR, ckpt_path, ralph_root, "canonical-eval")
 
 
 def judge_submission(
