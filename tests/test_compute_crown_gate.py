@@ -4,9 +4,9 @@ the *calibrated* H100 reference. Rewards efficiency, rejects runaway compute, wi
 no hard hour cap. Fully tunable (RALPH_COMPUTE_COST_WEIGHT / _H100_MATMUL_MS_REF /
 _CROWN_GATE)."""
 from validator.scoring import (
-    score_bundle,
-    _h100_matmul_ms_ref,
     DEFAULT_H100_MATMUL_MS_REF,
+    _h100_matmul_ms_ref,
+    score_bundle,
 )
 
 

@@ -3,7 +3,7 @@ throne has moved off of. Before the fix, the recovery merge re-added the previou
 king at king-level weight on top of the new king's, so set_weights emitted to BOTH
 kings every epoch until a set_weights finally landed and cleared pending_weights.
 """
-from validator.service import _merge_recovered_weights, KING_POOL_FRACTION
+from validator.service import KING_POOL_FRACTION, _merge_recovered_weights
 
 
 def test_king_change_drops_stale_recovered_king():
