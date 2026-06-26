@@ -536,6 +536,32 @@ KING_POOL_FRACTION = 0.9
 MEANINGFUL_FAILURE_POOL_FRACTION = 0.1
 
 
+def _merge_recovered_weights(
+    round_scores: dict[str, float],
+    recovered: dict[str, float],
+    current_king_hotkey: str | None,
+) -> dict[str, float]:
+    """Merge weights recovered from a rate-limited previous epoch into this
+    epoch's round_scores WITHOUT resurrecting a stale king.
+
+    `_apply_pool_split` already weights the CURRENT king authoritatively every
+    epoch, so a recovered king-level weight (>= KING_POOL_FRACTION) for any
+    hotkey OTHER than the current king is a previous reign whose set_weights got
+    rate-limited. Merging it would split emission across two kings — the
+    dethroned king keeps earning until a set_weights finally lands and clears the
+    pending file. We drop those, and skip the current king (its authoritative
+    weight is already in round_scores). Only sub-king (meaningful_failure)
+    credits that never landed are recovered, max-by-hotkey.
+    """
+    for hk, w in recovered.items():
+        if hk == current_king_hotkey:
+            continue  # current king already weighted this epoch — don't override
+        if w >= KING_POOL_FRACTION:
+            continue  # stale king from a prior reign — never resurrect
+        round_scores[hk] = max(round_scores.get(hk, 0.0), w)
+    return round_scores
+
+
 def _require_merged_king_pr() -> bool:
     """Opt-in policy: when setting weights, only emit to a king whose GitHub
     recipe PR is MERGED.
@@ -1160,10 +1186,14 @@ def run_epoch(
     # If no meaningful_failures this epoch, king gets 100%.
     round_scores = _apply_pool_split(chain, king_change_hotkey, meaningful_failure_hotkeys)
 
-    # Merge any weights recovered from a previous rate-limited epoch so we
-    # don't lose credit for a miner whose set_weights got dropped last time.
-    for hk, w in recovered.items():
-        round_scores[hk] = max(round_scores.get(hk, 0.0), w)
+    # Merge any weights recovered from a previous rate-limited epoch so we don't
+    # lose an unlanded meaningful_failure credit — but NEVER resurrect a king the
+    # throne has since moved off of (that splits emission across two kings).
+    current_king_hotkey = king_change_hotkey
+    if current_king_hotkey is None:
+        _sitting = chain.get_king()
+        current_king_hotkey = _sitting.miner_hotkey if _sitting is not None else None
+    round_scores = _merge_recovered_weights(round_scores, recovered, current_king_hotkey)
 
     # weights_set records whether the weight extrinsic actually landed this
     # epoch. It is INDEPENDENT of whether we build the audit report: the report
