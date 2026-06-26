@@ -610,10 +610,85 @@ def _patched_hidden_eval(
         )
 
 
+# --- Hidden-eval result cache -------------------------------------------------
+# A deferred challenger (king min-tenure guard) is re-scored EVERY epoch while it
+# waits out the incumbent's tenure (~300 blocks). The bundle and the held-out
+# eval shard are both immutable across those epochs, so the op4 GPU eval (~90 s)
+# returns an identical result each time — pure waste that also blocks the GPU
+# from processing new submissions. Cache it, keyed on a fingerprint of the eval
+# shard so the cache auto-invalidates the moment the shard is rotated. Stored as
+# a dotfile inside the bundle dir; op1 integrity is manifest-based (verifies only
+# the declared files), so the extra file is ignored.
+_EVAL_CACHE_FIELDS = (
+    "val_bpb", "benchmark_accuracy", "tokens_evaluated", "benchmark_examples",
+    "eval_set_hash", "val_seq_len", "sealed_stream_manifest_hash", "tail_val_bpb",
+)
+
+
+def _eval_shard_fingerprint(eval_dir: Path) -> str:
+    """sha256 over the held-out eval shard (tokens + benchmark). Changes iff the
+    eval set is rotated — exactly when a cached score MUST be discarded."""
+    h = hashlib.sha256()
+    for name in ("active_tokens.bin", "active_benchmark.json"):
+        p = eval_dir / name
+        h.update(name.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(p.read_bytes() if p.exists() else b"<missing>")
+    return h.hexdigest()
+
+
+def _eval_cache_path(proof_dir: Path) -> Path:
+    # A dotfile INSIDE the bundle dir. op1 integrity is manifest-based (it verifies
+    # only the declared files — checkpoint/training_log/calibration/attestation/
+    # patch — and recomputes bundle_hash from those four), so this extra file is
+    # ignored. It is archived with the bundle (harmless) and absent on a fresh
+    # re-download -> correct re-eval. Per-bundle, so no cross-bundle collision.
+    return proof_dir / ".hidden_eval_cache.json"
+
+
+def _load_cached_hidden_eval(proof_dir: Path, shard_fp: str) -> HiddenEvalResult | None:
+    try:
+        d = json.loads(_eval_cache_path(proof_dir).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return None
+    if d.get("eval_shard_fingerprint") != shard_fp:
+        return None  # eval shard rotated since this was cached
+    r = d.get("result")
+    if not isinstance(r, dict):
+        return None
+    try:
+        return HiddenEvalResult(**{k: r[k] for k in _EVAL_CACHE_FIELDS if k in r})
+    except (TypeError, KeyError):
+        return None
+
+
+def _save_cached_hidden_eval(proof_dir: Path, shard_fp: str, result: HiddenEvalResult) -> None:
+    # A downstream (CSDP) report is a nested object we don't round-trip here —
+    # skip the cache rather than drop it; the next epoch re-evals.
+    if getattr(result, "downstream", None) is not None:
+        return
+    payload = {
+        "eval_shard_fingerprint": shard_fp,
+        "result": {k: getattr(result, k) for k in _EVAL_CACHE_FIELDS},
+    }
+    try:
+        p = _eval_cache_path(proof_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload))
+    except OSError:
+        pass  # cache is a pure optimization — never fail scoring on a write error
+
+
 def op4_hidden_eval(
     ralph_root: Path,
     proof_dir: Path,
 ) -> tuple[bool, str, HiddenEvalResult | None]:
+    eval_dir = ralph_root / "eval" / "private"
+    shard_fp = _eval_shard_fingerprint(eval_dir)
+    cached = _load_cached_hidden_eval(proof_dir, shard_fp)
+    if cached is not None:
+        return True, f"val_bpb={cached.val_bpb:.4f} bench={cached.benchmark_accuracy:.3f} (cached)", cached
+
     ckpt_path = proof_dir / "training" / "checkpoint.pt"
     if not ckpt_path.exists():
         return False, f"missing checkpoint at {ckpt_path}", None
@@ -638,11 +713,15 @@ def op4_hidden_eval(
         # Retry under the patched workdir so the actually-trained model code
         # is what scores the checkpoint.
         if _is_state_dict_shape_mismatch(e):
-            return _patched_hidden_eval(ralph_root, proof_dir, ckpt_path)
+            ok, detail, result = _patched_hidden_eval(ralph_root, proof_dir, ckpt_path)
+            if ok and result is not None:
+                _save_cached_hidden_eval(proof_dir, shard_fp, result)
+            return ok, detail, result
         raise
     if torch.cuda.is_available():
         model = model.cuda()
-    result = run_hidden_eval(model, ralph_root / "eval" / "private", seq_len=cfg.max_seq_len // 2)
+    result = run_hidden_eval(model, eval_dir, seq_len=cfg.max_seq_len // 2)
+    _save_cached_hidden_eval(proof_dir, shard_fp, result)
     return True, f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f}", result
 
 
