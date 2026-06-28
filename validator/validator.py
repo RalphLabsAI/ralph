@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model import RalphBase, RalphConfig
 
-from eval import HiddenEvalResult, run_hidden_eval
+from eval import HiddenEvalResult
 from miner.submit import lookup_handshake, verify_signature
 from proof.mock_attest import (
     MockAttestation,
@@ -484,6 +484,108 @@ def _is_state_dict_shape_mismatch(err: Exception) -> bool:
     )
 
 
+def _run_eval_subprocess(
+    workdir: Path,
+    ckpt_path: Path,
+    ralph_root: Path,
+    label: str,
+) -> tuple[bool, str, HiddenEvalResult | None]:
+    """Run eval_in_workdir.py in a child process and parse its result.
+
+    Isolates the model build + GPU forward in a subprocess so a fatal CUDA fault
+    (illegal memory access / device-side assert) or a hang kills ONLY the child —
+    the validator rejects the bundle instead of aborting (a C++ CUDA abort can't
+    be caught in-process). `workdir` supplies the `model/` package the child
+    imports (canonical RECIPE_DIR or a patched copy); `label` prefixes messages.
+
+    SECURITY: the child runs miner-controlled model code, so it gets an
+    allowlist-only env (never the seal privkey / wallet / tokens) and its stderr
+    is redacted — same discipline as the op4 env-sanitize stopgap (PR#70).
+    """
+    import os
+    import subprocess
+
+    from proof.runner import _redacted, _sanitized_env
+
+    helper = Path(__file__).resolve().parent / "eval_in_workdir.py"
+    if not helper.exists():
+        return False, f"{label}: helper script missing at {helper}", None
+    # Allowlist-only env (no seal key / wallet / tokens). One exception: forward
+    # the validator's OWN RALPH_ALLOW_SYNTHETIC_EVAL — run_hidden_eval (canonical
+    # eval harness, runs IN the child) reads it to allow the testnet/CI synthetic
+    # fallback when no held-out shard is deployed. It is never set on mainnet
+    # (=> fail-closed there) and is not miner-settable, so forwarding it past the
+    # secret blocklist matches the in-process op4 semantics without weakening
+    # mainnet. The actual enforcement toggles (SKIP_HANDSHAKE, ALLOW_MOCK_
+    # ATTESTATION, TEST_MODE) stay blocked.
+    child_env = _sanitized_env(extra={"PYTHONPATH": str(workdir)})
+    if os.environ.get("RALPH_ALLOW_SYNTHETIC_EVAL"):
+        child_env["RALPH_ALLOW_SYNTHETIC_EVAL"] = os.environ["RALPH_ALLOW_SYNTHETIC_EVAL"]
+    try:
+        res = subprocess.run(
+            [sys.executable, str(helper), str(workdir), str(ckpt_path), str(ralph_root)],
+            capture_output=True,
+            text=True,
+            timeout=240,
+            env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{label} subprocess timed out (>240s)", None
+    if res.returncode != 0:
+        tail = _redacted(res.stderr or "")[-300:]
+        return False, f"{label} subprocess exit={res.returncode}: {tail}", None
+
+    marker = "RALPH_EVAL_RESULT "
+    line = next((ln for ln in (res.stdout or "").splitlines() if ln.startswith(marker)), None)
+    if line is None:
+        return False, f"{label}: no RALPH_EVAL_RESULT line in stdout", None
+    fields: dict[str, str] = {}
+    for tok in line[len(marker):].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+    required = ("val_bpb", "benchmark_acc", "tokens_evaluated", "benchmark_examples", "eval_set_hash")
+    if not all(k in fields for k in required):
+        return False, f"{label}: malformed result line: {line!r}", None
+
+    def _opt_float(key: str) -> float | None:
+        v = fields.get(key)
+        if v is None or v == "none":
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    def _opt_int(key: str) -> int | None:
+        v = fields.get(key)
+        if v is None or v == "none":
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    def _opt_str(key: str) -> str | None:
+        v = fields.get(key)
+        return None if (v is None or v == "none") else v
+
+    try:
+        result = HiddenEvalResult(
+            val_bpb=float(fields["val_bpb"]),
+            benchmark_accuracy=float(fields["benchmark_acc"]),
+            tokens_evaluated=int(fields["tokens_evaluated"]),
+            benchmark_examples=int(fields["benchmark_examples"]),
+            eval_set_hash=fields["eval_set_hash"],
+            val_seq_len=_opt_int("val_seq_len"),
+            sealed_stream_manifest_hash=_opt_str("sealed_stream_manifest_hash"),
+            tail_val_bpb=_opt_float("tail_val_bpb"),
+        )
+    except ValueError as e:
+        return False, f"{label}: result line parse error: {e}", None
+    return True, f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f} ({label})", result
+
+
 def _patched_hidden_eval(
     ralph_root: Path,
     proof_dir: Path,
@@ -498,10 +600,9 @@ def _patched_hidden_eval(
     don't need to branch on the path.
     """
     import shutil
-    import subprocess
     import tempfile
 
-    from proof.runner import _redacted, _sanitized_env, apply_patch
+    from proof.runner import apply_patch
 
     patch_path = proof_dir / "patch.diff"
     if not patch_path.exists():
@@ -531,90 +632,7 @@ def _patched_hidden_eval(
         except Exception as e:
             return False, f"patched-eval: patch apply failed: {str(e)[:200]}", None
 
-        helper = Path(__file__).resolve().parent / "eval_in_workdir.py"
-        if not helper.exists():
-            return False, f"patched-eval: helper script missing at {helper}", None
-
-        try:
-            res = subprocess.run(
-                [sys.executable, str(helper), str(workdir), str(ckpt_path), str(ralph_root)],
-                capture_output=True,
-                text=True,
-                timeout=240,
-                # SECURITY: eval_in_workdir.py imports and EXECUTES the miner's
-                # patched model.py. Never hand it the validator's environment —
-                # the seal privkey (RALPH_VALIDATOR_PRIVKEY), wallet, and cloud
-                # tokens would leak straight to attacker-controlled code. Pass an
-                # allowlist-only env (mirrors the miner-side training subprocess).
-                # PYTHONPATH points at the patched workdir so its model package wins.
-                env=_sanitized_env(extra={"PYTHONPATH": str(workdir)}),
-            )
-        except subprocess.TimeoutExpired:
-            return False, "patched-eval subprocess timed out (>240s)", None
-        if res.returncode != 0:
-            tail = _redacted(res.stderr or "")[-300:]
-            return False, f"patched-eval subprocess exit={res.returncode}: {tail}", None
-
-        marker = "RALPH_EVAL_RESULT "
-        line = next(
-            (ln for ln in (res.stdout or "").splitlines() if ln.startswith(marker)),
-            None,
-        )
-        if line is None:
-            return False, "patched-eval: no RALPH_EVAL_RESULT line in stdout", None
-
-        fields: dict[str, str] = {}
-        for tok in line[len(marker):].split():
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                fields[k] = v
-        required = ("val_bpb", "benchmark_acc", "tokens_evaluated", "benchmark_examples", "eval_set_hash")
-        if not all(k in fields for k in required):
-            return False, f"patched-eval: malformed result line: {line!r}", None
-
-        # Optional audit-reproducibility fields (validation-v2 Phase 1). Older
-        # helper versions don't emit them; "none" maps to None. Parse
-        # defensively so a malformed optional field never fails the eval.
-        def _opt_float(key: str) -> float | None:
-            v = fields.get(key)
-            if v is None or v == "none":
-                return None
-            try:
-                return float(v)
-            except ValueError:
-                return None
-
-        def _opt_int(key: str) -> int | None:
-            v = fields.get(key)
-            if v is None or v == "none":
-                return None
-            try:
-                return int(v)
-            except ValueError:
-                return None
-
-        def _opt_str(key: str) -> str | None:
-            v = fields.get(key)
-            return None if (v is None or v == "none") else v
-
-        try:
-            result = HiddenEvalResult(
-                val_bpb=float(fields["val_bpb"]),
-                benchmark_accuracy=float(fields["benchmark_acc"]),
-                tokens_evaluated=int(fields["tokens_evaluated"]),
-                benchmark_examples=int(fields["benchmark_examples"]),
-                eval_set_hash=fields["eval_set_hash"],
-                val_seq_len=_opt_int("val_seq_len"),
-                sealed_stream_manifest_hash=_opt_str("sealed_stream_manifest_hash"),
-                tail_val_bpb=_opt_float("tail_val_bpb"),
-            )
-        except ValueError as e:
-            return False, f"patched-eval: result line parse error: {e}", None
-        return (
-            True,
-            f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f} (patched-eval)",
-            result,
-        )
+        return _run_eval_subprocess(workdir, ckpt_path, ralph_root, "patched-eval")
 
 
 def _sandboxed_hidden_eval(
@@ -837,11 +855,16 @@ def op4_hidden_eval(
                 _save_cached_hidden_eval(proof_dir, shard_fp, result)
             return ok, detail, result
         raise
-    if torch.cuda.is_available():
-        model = model.cuda()
-    result = run_hidden_eval(model, eval_dir, seq_len=cfg.max_seq_len // 2)
-    _save_cached_hidden_eval(proof_dir, shard_fp, result)
-    return True, f"val_bpb={result.val_bpb:.4f} bench={result.benchmark_accuracy:.3f}", result
+    # The CPU load above only ROUTED canonical-vs-patched; free it and run the GPU
+    # forward in a SUBPROCESS so a fatal CUDA fault kills only the child (the
+    # validator rejects the bundle instead of aborting; a C++ CUDA abort can't be
+    # caught in-process). Default path; RALPH_SANDBOX=1 used the container above.
+    del model, state_dict
+    from ralph_bootstrap import RECIPE_DIR
+    ok, detail, result = _run_eval_subprocess(RECIPE_DIR, ckpt_path, ralph_root, "canonical-eval")
+    if ok and result is not None:
+        _save_cached_hidden_eval(proof_dir, shard_fp, result)
+    return ok, detail, result
 
 
 def judge_submission(
