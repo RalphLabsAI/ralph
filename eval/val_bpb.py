@@ -23,6 +23,7 @@ Per-stream bytes_per_token (B2):
 
 from __future__ import annotations
 
+import hashlib
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,6 +31,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from .host_reduce import BlankedCell
 
 if TYPE_CHECKING:
     from .sealed_streams import SealedStreamBatch
@@ -189,6 +192,200 @@ def per_position_nlls(
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(chunks).astype(np.float32)
+
+
+# --- HOSB: Host-Owned Suffix-Blanked scoring (look-ahead useless by construction) ---
+#
+# The validator scores the miner's own forward() to compute val_bpb. Under the
+# normal (seq_len+1) packing the target for position t is input[t+1] — it sits
+# INSIDE the model input, so a non-causal forward() can read the answer and drive
+# val_bpb -> 0 (a fraudulent, unbeatable king). Detecting that is structurally
+# impossible (the peek is in the shared prefix; a separate probe is distinguishable
+# in a co-batched forward). HOSB removes the answer instead: for each scored
+# position t the HOST feeds input[0..t] REAL and input[t+1..] overwritten with
+# real-text FILLER, and scores cross-entropy against the real next token it holds
+# out-of-band. A causal model is invariant to input[t+1..] so its score is
+# IDENTICAL to single-pass; a look-ahead model reads filler and gains nothing.
+
+
+def _seed_rng(seed: bytes) -> np.random.Generator:
+    """Deterministic numpy RNG from arbitrary seed bytes (block-hash-derived in
+    production). blake2b folds the bytes into a 32-bit seed sequence."""
+    digest = hashlib.blake2b(seed, digest_size=32).digest()
+    return np.random.default_rng(np.frombuffer(digest, dtype=np.uint32))
+
+
+def _draw_filler(rng: np.random.Generator, filler_tokens: np.ndarray, length: int) -> np.ndarray:
+    """`length` real-text filler tokens (a contiguous slice of the host's disjoint
+    filler corpus when possible, else a sample). Same distribution as the window
+    so a 'detect the seam' model gains nothing — and the answer is absent anyway."""
+    if length <= 0:
+        return np.zeros(0, dtype=np.int64)
+    n = len(filler_tokens)
+    if n >= length + 1:
+        start = int(rng.integers(0, n - length))
+        return filler_tokens[start : start + length].astype(np.int64)
+    return rng.choice(filler_tokens, size=length, replace=True).astype(np.int64)
+
+
+def build_blanked_grid(
+    eval_tokens: np.ndarray,
+    filler_tokens: np.ndarray,
+    seq_len: int,
+    seed: bytes,
+    *,
+    n_scored_per_window: int = 16,
+    tail_fraction: float = 0.4,
+    witness_fraction: float = 0.125,
+    wrong_target_fraction: float = 0.0625,
+) -> tuple[np.ndarray, np.ndarray, list[BlankedCell]]:
+    """HOST-side: build the blanked-input grid + targets + private layout.
+
+    Packs the same non-overlapping (seq_len+1) windows as compute_val_bpb. For
+    each window it draws `n_scored_per_window` host-secret scored indices from
+    [0, L-1] (a `tail_fraction` of them forced into [L//2:] so the long-context
+    tail is always covered). For each scored index `e` it emits ONE row:
+      idx_grid[row] = real input[0..e] then FILLER on [e+1..L-1]  (answer absent)
+      tgt_grid[row] = -100 everywhere except column e = the REAL next token
+    A `witness_fraction` of real cells get a SECOND row with a DIFFERENT filler
+    set B (two-filler invariance witness); a `wrong_target_fraction` of cells get
+    a deliberately-WRONG target (target-tensor-reading witness).
+
+    Returns (idx_grid (M,L) int64, tgt_grid (M,L) int64, layout). The `seed`
+    (block-hash-derived in production) makes the whole layout unpredictable at
+    submission and reproducible for audit; it is NEVER written into a
+    container-visible artifact (idx_grid/tgt_grid carry no positional marking).
+    """
+    eval_tokens = np.asarray(eval_tokens)
+    filler_tokens = np.asarray(filler_tokens)
+    L = int(seq_len)
+    if L < 2:
+        raise ValueError(f"seq_len must be >= 2; got {L}")
+    if len(filler_tokens) == 0:
+        raise ValueError("filler_tokens must be non-empty (host-held disjoint slice)")
+    if not 0.0 <= tail_fraction <= 1.0:
+        raise ValueError(f"tail_fraction must be in [0, 1]; got {tail_fraction}")
+    if not 0.0 <= witness_fraction <= 1.0:
+        raise ValueError(f"witness_fraction must be in [0, 1]; got {witness_fraction}")
+    if not 0.0 <= wrong_target_fraction < 1.0:
+        # < 1 so a real-target, filler-A scored cell always remains to score.
+        raise ValueError(f"wrong_target_fraction must be in [0, 1); got {wrong_target_fraction}")
+    rng = _seed_rng(seed)
+
+    n = len(eval_tokens)
+    n_windows = max(0, (n - 1) // L)
+    if n_windows == 0:
+        raise ValueError(f"eval stream too short ({n} tokens) for one (seq_len+1={L + 1}) window")
+    rows_idx: list[np.ndarray] = []
+    rows_tgt: list[np.ndarray] = []
+    layout: list[BlankedCell] = []
+    row = 0
+    tail_lo = L // 2
+    for w in range(n_windows):
+        start = w * L
+        window = eval_tokens[start : start + L + 1]
+        if len(window) < L + 1:
+            break
+        real_input = window[:L].astype(np.int64)        # positions 0..L-1
+        real_targets = window[1 : L + 1].astype(np.int64)  # target[t] = window[t+1]
+
+        # Stratified sampling: the forced-tail draws come from the TAIL stratum
+        # [L//2, L) and the rest from the HEAD stratum [0, L//2) ONLY — never the
+        # tail again. Keeping the strata disjoint lets reduce_blanked_nlls
+        # stratum-weight the mean so oversampling the tail does NOT bias val_bpb
+        # (the bug: drawing rest from setdiff(arange(L), tail) re-sampled the tail
+        # on top of the forced quota -> tail share > 0.5 -> ~1-2% low bias).
+        n_sc = min(n_scored_per_window, L)
+        n_tail = min(int(round(tail_fraction * n_sc)), L - tail_lo)
+        tail_pos = (
+            rng.choice(np.arange(tail_lo, L), size=n_tail, replace=False)
+            if n_tail > 0 else np.empty(0, dtype=np.int64)
+        )
+        head_pool = np.arange(0, tail_lo)
+        n_rest = min(n_sc - len(tail_pos), len(head_pool))
+        rest_pos = rng.choice(head_pool, size=n_rest, replace=False) if n_rest > 0 else np.empty(0, dtype=np.int64)
+        scored = np.concatenate([tail_pos, rest_pos]).astype(int)
+
+        for e in scored:
+            e = int(e)
+            idx_row = real_input.copy()
+            idx_row[e + 1 :] = _draw_filler(rng, filler_tokens, L - 1 - e)
+            tgt_row = np.full(L, -100, dtype=np.int64)
+            if rng.random() < wrong_target_fraction:
+                # A host-known token that differs from the real next token.
+                wrong = int(rng.choice(filler_tokens))
+                guard = 0
+                while wrong == int(real_targets[e]) and guard < 8:
+                    wrong = int(rng.choice(filler_tokens))
+                    guard += 1
+                if wrong == int(real_targets[e]):  # degenerate filler — skip the witness
+                    tgt_row[e] = int(real_targets[e])
+                    kind = "real"
+                else:
+                    tgt_row[e] = wrong
+                    kind = "wrong"
+            else:
+                tgt_row[e] = int(real_targets[e])
+                kind = "real"
+            rows_idx.append(idx_row)
+            rows_tgt.append(tgt_row)
+            layout.append(BlankedCell(row=row, window=w, pos=e, target_kind=kind, filler_set="A"))
+            row += 1
+
+            # Two-filler witness: a second copy of a REAL cell with different filler.
+            if kind == "real" and rng.random() < witness_fraction:
+                idx_rowB = real_input.copy()
+                idx_rowB[e + 1 :] = _draw_filler(rng, filler_tokens, L - 1 - e)
+                tgt_rowB = np.full(L, -100, dtype=np.int64)
+                tgt_rowB[e] = int(real_targets[e])
+                rows_idx.append(idx_rowB)
+                rows_tgt.append(tgt_rowB)
+                layout.append(BlankedCell(row=row, window=w, pos=e, target_kind="real", filler_set="B"))
+                row += 1
+
+    idx_grid = np.stack(rows_idx) if rows_idx else np.zeros((0, L), dtype=np.int64)
+    tgt_grid = np.stack(rows_tgt) if rows_tgt else np.zeros((0, L), dtype=np.int64)
+    return idx_grid, tgt_grid, layout
+
+
+def per_position_nlls_blanked(
+    model: torch.nn.Module,
+    idx_grid: np.ndarray,
+    tgt_grid: np.ndarray,
+    batch_size: int = 8,
+    device: torch.device | None = None,
+) -> np.ndarray:
+    """Producer (runs the miner's model): per-position NLL over the HOST grid.
+
+    Runs the SAME `logits, _ = model(idx_batch)` call as today over the host's
+    blanked rows and returns cross-entropy (nats) against tgt_grid with
+    reduction='none', ignore_index=-100 — so only each row's single host-chosen
+    scored cell carries a value (others are 0). Knows nothing about which cell is
+    scored/witness/tail (that is the host layout). Pure function of (model, grid);
+    the model never sees the targets (CE is computed here, not inside forward()).
+    """
+    idx_grid = np.asarray(idx_grid)
+    tgt_grid = np.asarray(tgt_grid)
+    if idx_grid.shape != tgt_grid.shape:
+        raise ValueError(f"idx/tgt grid shape mismatch: {idx_grid.shape} vs {tgt_grid.shape}")
+    M, L = idx_grid.shape
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+    out = np.zeros((M, L), dtype=np.float32)
+    with torch.no_grad():
+        for s in range(0, M, batch_size):
+            inp = torch.from_numpy(idx_grid[s : s + batch_size].astype(np.int64)).to(device)
+            tgt = torch.from_numpy(tgt_grid[s : s + batch_size].astype(np.int64)).to(device)
+            logits, _ = model(inp)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                tgt.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            )
+            out[s : s + inp.size(0)] = nll.reshape(inp.size(0), L).detach().float().cpu().numpy()
+    return out
 
 
 def compute_val_bpb_on_stream(

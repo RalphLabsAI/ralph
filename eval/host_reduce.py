@@ -41,6 +41,154 @@ class HostReduced:
     eval_set_hash: str  # sha256 of the HOST's target stream (not miner-supplied)
 
 
+class NonCausalModelError(RuntimeError):
+    """The producer's per-position NLL is not consistent with an honest causal
+    model under the HOST's blanked-grid scoring (HOSB) — its scored-position NLL
+    moved when only the (post-position) filler changed, or it scored a
+    deliberately-wrong target near zero (reading the target tensor / looking
+    ahead). The caller treats this as a rejected submission, never a silent pass.
+    """
+
+
+@dataclass(frozen=True)
+class BlankedCell:
+    """Host-private record binding one emitted grid row to what it scores.
+
+    `pos` is the single scored sequence index of `row` (the last REAL token
+    before the blanked filler suffix); `target_kind` is "real" (counts toward
+    val_bpb) or "wrong" (a deliberately-wrong target, witness only); `filler_set`
+    is "A" (the scored copy) or "B" (a second copy with different filler, witness
+    only). NEVER serialized into any container-visible artifact — it is the host
+    layout the container is not told.
+    """
+
+    row: int
+    window: int
+    pos: int
+    target_kind: str  # "real" | "wrong"
+    filler_set: str   # "A" | "B"
+
+
+def reduce_blanked_nlls(
+    nlls_2d: np.ndarray,
+    layout: list[BlankedCell],
+    *,
+    seq_len: int,
+    bytes_per_token: float,
+    eval_set_hash: str,
+    tol_witness: float = 0.05,
+    wrong_target_floor: float = 1.0,
+    wrong_target_max_low_frac: float = 0.5,
+) -> HostReduced:
+    """HOST verdict over a HOSB blanked-grid NLL array. Re-runs no model.
+
+    `nlls_2d` is the (M, L) per-position NLL the producer emitted over the host's
+    blanked grid (`build_blanked_grid`). `layout` is the host-private map from row
+    to its scored cell. Because every scored position's strict future was
+    overwritten with filler before the producer ran, a look-ahead forward read
+    filler (not the answer) and CANNOT drive the scored NLL to ~0 — so the score
+    is honest BY CONSTRUCTION. Two host-owned witnesses catch residual cheats:
+
+      * two-filler (A/B): for a causal/future-independent producer the scored NLL
+        is invariant to the filler bytes; a row's "B" copy (same prefix + target,
+        different filler) must match its "A" copy within `tol_witness`.
+      * wrong-target: a producer reading the target tensor one-hots a
+        deliberately-wrong target and scores it ~0. An HONEST model scores a
+        RANDOM wrong target near-uniformly (it can't confidently predict a random
+        token), so only a SMALL fraction of wrong cells land below
+        `wrong_target_floor` (an occasional argmax collision). We reject only when
+        MORE than `wrong_target_max_low_frac` of wrong cells are sub-floor — a
+        target-reader is ~all sub-floor; a confident-but-honest model is not.
+
+    val_bpb is a STRATUM-WEIGHTED mean over the real-target, filler-A cells: head
+    [0:L//2) and tail [L//2:L) are weighted by their true sizes, so oversampling
+    the tail (forced tail coverage) does NOT bias val_bpb relative to
+    compute_val_bpb's full-window mean. Witness rows (B and wrong) never score.
+    Raises NonCausalModelError on a witness failure; ValueError on a malformed
+    array (non-finite / negative / out-of-range) or a grid with no scored cell.
+    """
+    if bytes_per_token <= 0:
+        raise ValueError(f"bytes_per_token must be > 0; got {bytes_per_token}")
+    nlls_2d = np.asarray(nlls_2d, dtype=np.float64)
+    if nlls_2d.ndim != 2:
+        raise ValueError(f"nlls_2d must be 2-D (M,L); got shape {nlls_2d.shape}")
+    M, L = nlls_2d.shape
+
+    # Validate every scored cell the host knows about (index bounds + sanity).
+    for c in layout:
+        if not (0 <= c.row < M and 0 <= c.pos < L):
+            raise ValueError(f"layout cell out of bounds: row={c.row} pos={c.pos} for {nlls_2d.shape}")
+        v = nlls_2d[c.row, c.pos]
+        if not np.isfinite(v):
+            raise ValueError("nll array has a non-finite value at a scored cell")
+        if v < 0:
+            raise ValueError("nll array has a negative cross-entropy at a scored cell (impossible)")
+
+    # WRONG-TARGET WITNESS: a model that reads/one-hots the target tensor scores
+    # ~0 on a deliberately-wrong target — and on (almost) ALL of them, since it
+    # can't tell wrong cells from real ones. An honest model scores a RANDOM wrong
+    # token near-uniformly; only an occasional argmax collision lands sub-floor.
+    # Reject on the AGGREGATE (fraction), never a single cell (that false-rejects
+    # confident honest models — a strictly-causal peaked LM collides sometimes).
+    wrong_cells = [c for c in layout if c.target_kind == "wrong"]
+    if wrong_cells:
+        low = sum(1 for c in wrong_cells if nlls_2d[c.row, c.pos] < wrong_target_floor)
+        frac_low = low / len(wrong_cells)
+        if frac_low > wrong_target_max_low_frac:
+            raise NonCausalModelError(
+                f"{low}/{len(wrong_cells)} ({frac_low:.0%}) deliberately-wrong targets scored "
+                f"< {wrong_target_floor} nats (> {wrong_target_max_low_frac:.0%}) — reading the "
+                f"target tensor / look-ahead, rejected"
+            )
+
+    # TWO-FILLER WITNESS: scored NLL must be invariant to the filler bytes.
+    a_by_cell = {
+        (c.window, c.pos): c
+        for c in layout
+        if c.target_kind == "real" and c.filler_set == "A"
+    }
+    for c in layout:
+        if c.target_kind == "real" and c.filler_set == "B":
+            a = a_by_cell.get((c.window, c.pos))
+            if a is not None and abs(nlls_2d[c.row, c.pos] - nlls_2d[a.row, a.pos]) > tol_witness:
+                raise NonCausalModelError(
+                    f"blanked-position NLL moved {abs(nlls_2d[c.row, c.pos] - nlls_2d[a.row, a.pos]):.4f} "
+                    f"> {tol_witness} when only filler changed — future-dependent forward(), rejected"
+                )
+
+    # SCORE: real-target, filler-A cells only (B and wrong are witness-only).
+    score_cells = [c for c in layout if c.target_kind == "real" and c.filler_set == "A"]
+    if not score_cells:
+        raise ValueError("no real-target scored cells in layout — malformed HOSB grid (fail loud, never inf)")
+
+    # Stratum-weighted mean: head [0:tail_start) and tail [tail_start:L) are
+    # weighted by their TRUE sizes, so forcing extra tail coverage does not bias
+    # val_bpb relative to compute_val_bpb's uniform full-window mean. Positions
+    # are sampled uniformly WITHIN each stratum, so each stratum mean is unbiased.
+    tail_start = seq_len // 2
+    head_vals = np.array([nlls_2d[c.row, c.pos] for c in score_cells if c.pos < tail_start], dtype=np.float64)
+    tail_vals = np.array([nlls_2d[c.row, c.pos] for c in score_cells if c.pos >= tail_start], dtype=np.float64)
+    if head_vals.size and tail_vals.size:
+        mean_nll = (tail_start * head_vals.mean() + (seq_len - tail_start) * tail_vals.mean()) / seq_len
+    else:  # only one stratum sampled (tiny n_scored) — flat mean of what's present
+        mean_nll = float(np.concatenate([head_vals, tail_vals]).mean())
+
+    bpb = mean_nll / (LN2 * bytes_per_token)
+    nll_per_token = float(mean_nll)
+    tail_bpb: float | None = (
+        float(tail_vals.mean()) / (LN2 * bytes_per_token) if tail_vals.size else None
+    )
+
+    return HostReduced(
+        val_bpb=bpb,
+        tail_val_bpb=tail_bpb,
+        nll_per_token=nll_per_token,
+        tokens_evaluated=len(score_cells),
+        bytes_per_token=bytes_per_token,
+        eval_set_hash=eval_set_hash,
+    )
+
+
 def expected_token_count(stream_len: int, seq_len: int) -> int:
     """Number of target positions `compute_val_bpb` scores over a stream of
     `stream_len` tokens: non-overlapping windows of (seq_len+1), each
