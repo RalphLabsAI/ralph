@@ -95,8 +95,14 @@ def test_patched_eval_subprocess_uses_sanitized_env(monkeypatch, tmp_path):
 
     env = captured["env"]
     assert env is not None, "subprocess was spawned without an explicit env"
-    for name in (*_MUST_BLOCK, "BT_WALLET_PASSWORD", "HF_TOKEN"):
+    # RALPH_ALLOW_SYNTHETIC_EVAL is the validator's OWN eval toggle — read by the
+    # canonical eval harness in the child — so it IS forwarded (it's still in the
+    # blocklist, then explicitly re-added by _run_eval_subprocess). Everything
+    # else in _MUST_BLOCK (secrets + the real enforcement toggles) stays blocked.
+    blocked = tuple(n for n in _MUST_BLOCK if n != "RALPH_ALLOW_SYNTHETIC_EVAL")
+    for name in (*blocked, "BT_WALLET_PASSWORD", "HF_TOKEN"):
         assert name not in env, f"{name} leaked to the miner-code subprocess"
+    assert env.get("RALPH_ALLOW_SYNTHETIC_EVAL") == "1", "validator's own synthetic-eval toggle should be forwarded"
     leaked = {"seal_privkey_should_not_leak_123", "wallet_pw_should_not_leak", "hf_should_not_leak_abcdefgh"}
     assert not (leaked & set(env.values())), "a secret value leaked into the subprocess env"
     # PYTHONPATH is the per-bundle patched workdir (a TemporaryDirectory created
