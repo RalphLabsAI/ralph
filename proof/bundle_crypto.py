@@ -25,7 +25,7 @@ import tarfile
 from pathlib import Path
 
 # Published validator encryption public key (X25519, base64).
-DEFAULT_VALIDATOR_PUBKEY = "+dCaAtEE/NCKUjOfktuKlKSs5WaER558CqPXJnz3eng="
+DEFAULT_VALIDATOR_PUBKEY = "RGYlkk6Bl+FaD3lv/jouRSvIw4B+xUVvXu4klJJN328="
 
 ENC_SCHEME = "sealed_box_x25519_v1"
 ENC_FILENAME = "bundle.enc"
