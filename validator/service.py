@@ -45,7 +45,7 @@ from chain_layer.config import get_chain
 from validator.hf_poller import DEFAULT_REPO as DEFAULT_HF_REPO
 from validator.hf_poller import poll_hub
 from validator.scoring import score_bundle
-from validator.validator import judge_submission
+from validator.validator import _hosb_mode, judge_submission, op4_hidden_eval
 
 
 # Bittensor's bt.logging hijacks Python's logging module and raises the root
@@ -392,6 +392,35 @@ def score_and_decide(
     hwm = chain.get_high_water_mark()
     bar_bpb = king_bpb if king else (hwm.get("val_bpb") if hwm else None)
     bar_bench = king_bench if king else (hwm.get("benchmark_accuracy") if hwm else None)
+
+    # HOSB enforce: the challenger's val_bpb is the host-owned lower-bound-Z number,
+    # which UNDER-estimates the true CE. A king crowned/recorded under the legacy
+    # full-softmax path is NOT comparable — the bias doesn't cancel in quality_gain.
+    # So re-score the incumbent king under the IDENTICAL HOSB path on the SAME epoch
+    # grid (common random numbers via the epoch seed; cached per epoch). FAIL-CLOSED:
+    # if the king can't be re-scored, or the eval windows differ, DON'T crown.
+    king_bar_unverified = False
+    if _hosb_mode() == "enforce" and king is not None:
+        kp = Path(king.proof_dir) if king.proof_dir else None
+        if kp is not None and (kp / "training" / "checkpoint.pt").exists():
+            ok_k, detail_k, king_hosb = op4_hidden_eval(RALPH_ROOT, kp, chain=chain)
+            if (
+                ok_k and king_hosb is not None
+                and result.hidden_eval.val_seq_len == king_hosb.val_seq_len
+            ):
+                bar_bpb = king_hosb.val_bpb
+                bar_bench = king_hosb.benchmark_accuracy
+            else:
+                king_bar_unverified = True
+                log_warn(
+                    f"HOSB king re-score unusable (ok={ok_k}, "
+                    f"L_chal={result.hidden_eval.val_seq_len} L_king="
+                    f"{getattr(king_hosb, 'val_seq_len', None)}): {detail_k} — NOT crowning"
+                )
+        else:
+            king_bar_unverified = True
+            log_warn("HOSB enforce: king checkpoint unavailable for re-score — NOT crowning")
+
     # v1.2: single attested-execution tier. op2 either passed (tier="verified")
     # or rejected the submission outright. Treat the field defensively for any
     # legacy bundle that slips through.
@@ -409,7 +438,9 @@ def score_and_decide(
     )
 
     is_first = king is None and hwm is None
-    decisively = score.decisively_beats_king or is_first
+    # Fail-closed: under HOSB enforce a challenger can only crown against a king bar
+    # re-scored on the identical path; if that re-score was unusable, do NOT crown.
+    decisively = (score.decisively_beats_king or is_first) and not king_bar_unverified
 
     classification, weight_credit = _classify_outcome(
         decisively=decisively,
