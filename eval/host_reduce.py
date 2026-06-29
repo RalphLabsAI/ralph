@@ -29,6 +29,121 @@ from dataclasses import dataclass
 import numpy as np
 
 LN2 = math.log(2)
+# Honest pre-softmax logits sit in ~[-50, 50] (logit_softcap is ~30); anything
+# beyond ~100 is a forged/degenerate emission whose only purpose is to drive CE to
+# (near) zero via float cancellation/underflow. Reject it.
+_MAX_ABS_LOGIT = 100.0
+
+
+def ce_from_topk_logits(
+    topk_logits: np.ndarray,
+    topk_indices: np.ndarray,
+    targets: np.ndarray,
+    vocab_size: int,
+) -> np.ndarray:
+    """Host-side cross-entropy (nats) at each scored cell from the container's
+    emitted top-K logits. The container NEVER receives the targets (leak-free) AND
+    never supplies the partition function: the HOST computes it.
+
+    The (untrusted) producer emits, per scored row, only the top-K logits + their
+    vocab indices. The host sets ``Z_hat = logsumexp(emitted top-K)`` — a true
+    LOWER BOUND on the full-vocab partition function (a partial sum cannot exceed
+    the full sum). Then:
+
+      * target in the emitted top-K:  CE = Z_hat - logit[target].
+      * target NOT in top-K (ranked below the emitted set): CE = Z_hat - min(top-K)
+        — the boundary logit is an upper bound on an unranked target's logit, so
+        this is the *lowest* CE the cell can honestly carry, and a degenerate
+        emission (one real token + filler) makes min(top-K) tiny → a huge miss CE.
+
+    Why this is robust (vs. trusting a container ``logsumexp``): the container
+    CANNOT make Z_hat smaller than logsumexp(its true top-K) — emitting more/larger
+    entries only RAISES Z_hat and thus CE; and CE is invariant to a uniform logit
+    shift (Z_hat and logit[target] shift together). So the "claim tail=0 to deflate"
+    and "uniformly rescale" forgeries are structurally impossible. The only residual
+    lever is omitting REAL tail mass, which deflates a hit cell by exactly
+    -log(1-tail_K) (tail_K = the model's true out-of-top-K mass); raising K bounds
+    that below the crown margin, and dropping mid-rank tokens to enlarge the gap
+    sends every non-top-1-correct cell to the huge boundary miss CE — self-defeating
+    for any realistic (sub-perfect top-1) model.
+
+    `vocab_size` is used ONLY for index-range validation. Returns float64 (M,) CE.
+    """
+    topk_logits = np.asarray(topk_logits, dtype=np.float64)
+    topk_indices = np.asarray(topk_indices)
+    targets = np.asarray(targets)
+    if topk_logits.ndim != 2 or topk_logits.shape != topk_indices.shape:
+        raise ValueError(
+            f"topk_logits/topk_indices must match 2-D shapes; got {topk_logits.shape} {topk_indices.shape}"
+        )
+    m, k = topk_logits.shape
+    if targets.shape != (m,):
+        raise ValueError(f"targets must be ({m},); got {targets.shape}")
+    if not np.all(np.isfinite(topk_logits)):
+        raise ValueError("non-finite topk_logits")
+    if np.any((topk_indices < 0) | (topk_indices >= vocab_size)):
+        raise ValueError("topk_indices outside [0, vocab_size)")
+    sorted_i = np.sort(topk_indices, axis=1)
+    if k > 1 and np.any(sorted_i[:, 1:] == sorted_i[:, :-1]):
+        raise ValueError("duplicate topk_indices within a row")
+    # Magnitude cap: an honest softmax never needs |logit| > ~50; huge-but-finite
+    # logits (e.g. 1e18) make z_hat - logit[target] catastrophically cancel to 0
+    # (differences fall below the float ULP), forging CE=0. Reject them outright.
+    if np.any(np.abs(topk_logits) > _MAX_ABS_LOGIT):
+        raise ValueError(f"topk_logits magnitude exceeds {_MAX_ABS_LOGIT} — forged/degenerate emission")
+
+    # Cross-entropy from MAX-SHIFTED logits so all terms are O(log K) and there is
+    # no catastrophic cancellation. z_hat = logsumexp(top-K) is the host's lower
+    # bound on the full-vocab Z; CE = z_hat - logit[target] = lse_shifted -
+    # (logit[target] - mx).
+    mx = topk_logits.max(axis=1)
+    shifted = topk_logits - mx[:, None]
+    lse_shifted = np.log(np.exp(shifted).sum(axis=1))   # = z_hat - mx, in [0, log K]
+    match = topk_indices == targets[:, None]            # (M, K) — one True at most per row
+    hit = match.any(axis=1)
+    tgt_shifted = np.where(match, shifted, -np.inf).max(axis=1)  # logit[target]-mx (<=0), -inf if absent
+    ce_hit = lse_shifted - tgt_shifted                  # valid where hit
+    ce_miss = lse_shifted - shifted.min(axis=1)         # target below the K-th: boundary CE
+    return np.maximum(np.where(hit, ce_hit, ce_miss), 0.0)
+
+
+def reduce_benchmark_scores(
+    bench_scores: np.ndarray,
+    correct_pos: np.ndarray,
+    n_witness: int = 0,
+) -> tuple[float, float]:
+    """HOST verdict for the multiple-choice benchmark: the container emits a score
+    per SHUFFLED candidate (it never sees which slot is correct); the host argmaxes
+    and compares to the PRIVATE `correct_pos`.
+
+    `bench_scores` is (N, C). For each example the predicted slot is argmax; ties
+    get FRACTIONAL credit (1/#tied if `correct_pos` is in the tie set) so an
+    all-equal / blind producer scores exactly E[acc] = mean(1/C), not 1.0. Because
+    argmax is permutation-equivariant, an honest deterministic model gets the SAME
+    accuracy as the legacy un-shuffled scorer (king comparability). Returns
+    (accuracy, stderr). `n_witness` trailing rows (if any) are excluded.
+    """
+    bench_scores = np.asarray(bench_scores, dtype=np.float64)
+    correct_pos = np.asarray(correct_pos)
+    if bench_scores.ndim != 2:
+        raise ValueError(f"bench_scores must be 2-D (N,C); got {bench_scores.shape}")
+    n, c = bench_scores.shape
+    if correct_pos.shape != (n,):
+        raise ValueError(f"correct_pos must be ({n},); got {correct_pos.shape}")
+    if not np.all(np.isfinite(bench_scores)):
+        raise ValueError("non-finite benchmark scores")
+    keep = n - max(0, int(n_witness))
+    if keep <= 0:
+        return 0.0, 0.0
+    credit = 0.0
+    for i in range(keep):
+        row = bench_scores[i]
+        tied = np.flatnonzero(row >= row.max() - 1e-9)
+        if correct_pos[i] in tied:
+            credit += 1.0 / len(tied)
+    acc = credit / keep
+    stderr = math.sqrt(max(acc * (1.0 - acc), 0.0) / keep)
+    return acc, stderr
 
 
 @dataclass(frozen=True)
@@ -78,7 +193,7 @@ def reduce_blanked_nlls(
     eval_set_hash: str,
     tol_witness: float = 0.05,
     wrong_target_floor: float = 1.0,
-    wrong_target_max_low_frac: float = 0.5,
+    wrong_target_max_low_frac: float = 0.1,
 ) -> HostReduced:
     """HOST verdict over a HOSB blanked-grid NLL array. Re-runs no model.
 

@@ -139,6 +139,127 @@ def run_sandbox_eval(
     return nlls
 
 
+def _load_model_from_workdir(workdir: Path, ckpt_path: Path):
+    """Load the (patched) model from the workdir + checkpoint. Caller must have
+    imported any TRUSTED helpers BEFORE calling this — it puts the miner workdir
+    on sys.path. Returns (model, cfg)."""
+    import json as _json
+
+    sys.path.insert(0, str(Path(workdir).resolve()))
+    import torch
+    from model import RalphBase, RalphConfig
+
+    sidecar = Path(ckpt_path).parent / "checkpoint_config.json"
+    if sidecar.exists():
+        saved = _json.loads(sidecar.read_text())
+    else:
+        saved = torch.load(ckpt_path, weights_only=True, map_location="cpu").get("config", {})
+    fields = RalphConfig.__dataclass_fields__
+    cfg = RalphConfig(**{k: v for k, v in saved.items() if k in fields})
+    ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+    state_dict = ckpt.get("model", ckpt)
+    model = RalphBase(cfg)
+    model.load_state_dict(state_dict)
+    if torch.cuda.is_available():
+        model = model.cuda()
+    return model, cfg
+
+
+def run_sandbox_grid_eval(
+    workdir: Path,
+    ckpt_path: Path,
+    grid_dir: Path,
+    out_dir: Path,
+    *,
+    batch_size: int = 8,
+):
+    """HOSB grid mode: emit TOP-K logits at the host-given scored positions.
+
+    The container is given ONLY idx_grid (blanked rows) + scored_idx (the scored
+    position per row — NOT the answer) + an optional benchmark file. It NEVER
+    receives the targets, so miner code cannot read the answer key off disk (the
+    leak-free contract). It runs the model's forward() and emits, per scored row,
+    the top-K logits + their vocab indices + the row logsumexp; the HOST computes
+    cross-entropy against its private targets (`eval.host_reduce.ce_from_topk_logits`)
+    and reduces val_bpb. Importable + CPU-unit-testable in-process (no container).
+    """
+    import numpy as np
+    import torch
+
+    grid_dir = Path(grid_dir)
+    out_dir = Path(out_dir)
+    job = {}
+    jpath = grid_dir / "job.json"
+    if jpath.exists():
+        job = json.loads(jpath.read_text())
+    top_k = int(job.get("top_k", 256))
+
+    model, cfg = _load_model_from_workdir(workdir, ckpt_path)
+    device = next(model.parameters()).device
+    model.eval()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    idx_grid = np.load(grid_dir / "idx_grid.npy")
+    scored_idx = np.load(grid_dir / "scored_idx.npy")  # (M,), the scored column per row
+    m, _l = idx_grid.shape
+    k = min(top_k, int(cfg.vocab_size))
+
+    topk_vals = np.zeros((m, k), dtype=np.float32)
+    topk_idx = np.zeros((m, k), dtype=np.int64)
+    with torch.no_grad():
+        for s in range(0, m, batch_size):
+            inp = torch.from_numpy(idx_grid[s : s + batch_size].astype(np.int64)).to(device)
+            logits, _ = model(inp)  # (b, L, V)
+            rows = torch.arange(inp.size(0))
+            cols = torch.from_numpy(scored_idx[s : s + batch_size].astype(np.int64)).to(device)
+            scored_logits = logits[rows, cols, :]  # (b, V) — only the scored cell
+            vals, idx = torch.topk(scored_logits, k, dim=-1)
+            topk_vals[s : s + inp.size(0)] = vals.float().cpu().numpy()
+            topk_idx[s : s + inp.size(0)] = idx.long().cpu().numpy()
+
+    # Host-reduced benchmark (HRB): the host placed a SHUFFLED candidate grid (no
+    # correct-index marker, no raw answer file). We emit the model's score per
+    # shuffled candidate; the HOST argmaxes against its private correct slot. We do
+    # NOT compute accuracy in-container (it would be forgeable + needs the answer).
+    bench_rows = 0
+    cpath = grid_dir / "bench_cands.npy"
+    if cpath.exists():
+        cands_shuf = np.load(cpath)                 # (N, C) shuffled candidate ids
+        ctx_flat = np.load(grid_dir / "bench_context.npy")
+        ctx_off = np.load(grid_dir / "bench_ctx_offsets.npy")
+        bench_rows = int(cands_shuf.shape[0])
+        bench_scores = np.zeros(cands_shuf.shape, dtype=np.float32)
+        with torch.no_grad():
+            for i in range(bench_rows):
+                ctx = ctx_flat[int(ctx_off[i]) : int(ctx_off[i + 1])].astype(np.int64)
+                logits, _ = model(torch.from_numpy(ctx)[None].to(device))
+                last = logits[0, -1]
+                cols = torch.from_numpy(cands_shuf[i].astype(np.int64)).to(device)
+                bench_scores[i] = last[cols].float().cpu().numpy()
+        np.save(out_dir / "bench_scores.npy", bench_scores)
+
+    np.save(out_dir / "topk_logits.npy", topk_vals)
+    np.save(out_dir / "topk_indices.npy", topk_idx)
+    # NO logsumexp emitted: the HOST computes Z_hat = logsumexp(emitted top-K)
+    # itself (a lower bound on the true partition function), so a container can't
+    # forge the denominator to deflate cross-entropy.
+    manifest = {
+        "status": "ok",
+        "mode": "hosb_grid_topk",
+        "rows": int(m),
+        "top_k": int(k),
+        "bench_rows": bench_rows,
+        "model_config": {
+            "vocab_size": cfg.vocab_size,
+            "dim": cfg.dim,
+            "n_layers": cfg.n_layers,
+            "max_seq_len": cfg.max_seq_len,
+        },
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    return topk_vals, topk_idx
+
+
 def run_prepare_and_eval(
     canon_dir: Path,
     patch_path: Path,
@@ -156,7 +277,45 @@ def run_prepare_and_eval(
     return run_sandbox_eval(workdir, ckpt_path, eval_dir, out_dir, batch_size=batch_size)
 
 
+def run_prepare_and_grid_eval(
+    canon_dir: Path,
+    patch_path: Path,
+    ckpt_path: Path,
+    grid_dir: Path,
+    out_dir: Path,
+    *,
+    batch_size: int = 8,
+):
+    """Full container flow for HOSB grid mode: prepare workdir, then grid-eval."""
+    import tempfile
+
+    workdir = prepare_workdir(canon_dir, patch_path, Path(tempfile.mkdtemp(prefix="ralph_sbx_")) / "workdir")
+    return run_sandbox_grid_eval(workdir, ckpt_path, grid_dir, out_dir, batch_size=batch_size)
+
+
 def main(argv: list[str]) -> int:
+    # HOSB grid mode: `--grid <canon> <patch> <ckpt> <grid_dir> <out>`. The grid
+    # dir holds the host-built idx_grid/tgt_grid (+ optional benchmark); the raw
+    # shard is NOT mounted in this mode.
+    if len(argv) >= 2 and argv[1] == "--grid":
+        if len(argv) != 7:
+            print(f"usage: {argv[0]} --grid <canon_dir> <patch.diff> <ckpt_path> <grid_dir> <out_dir>", file=sys.stderr)
+            return 3
+        canon_dir, patch_path, ckpt_path, grid_dir, out_dir = (Path(a) for a in argv[2:7])
+        if not canon_dir.is_dir() or not ckpt_path.is_file() or not grid_dir.is_dir():
+            print("ERROR: canon_dir/ckpt/grid_dir must exist", file=sys.stderr)
+            return 3
+        try:
+            run_prepare_and_grid_eval(canon_dir, patch_path, ckpt_path, grid_dir, out_dir)
+        except (ImportError, KeyError, RuntimeError) as e:
+            print(f"ERROR: setup/load failed: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: grid eval crashed: {e}", file=sys.stderr)
+            return 2
+        print("RALPH_SANDBOX_GRID_EVAL ok")
+        return 0
+
     if len(argv) != 6:
         print(f"usage: {argv[0]} <canon_dir> <patch.diff> <ckpt_path> <eval_dir> <out_dir>", file=sys.stderr)
         return 3
