@@ -293,6 +293,12 @@ _WEIGHT_LOAD_RE = re.compile(
     r"\b(?:torch\.load|pickle\.loads?|np\.load|numpy\.load|joblib\.load|load_file|safetensors\w*\.\w*load\w*)\s*\("
 )
 _ABS_WEIGHT_PATH_RE = re.compile(r"""['"`]/[^'"`]*\.(?:pt|pth|ckpt|safetensors|bin|pkl|npz)\b""")
+# Manifest REGENERATION: the canonical run LOADS the locked data_manifest; it never
+# rebuilds it. A patch that imports/calls build_manifest re-derives the manifest from
+# whatever shards are present at runtime -> trains on miner-chosen data (the in-the-
+# wild /dstack bypass). Mechanism-based (not path-based): catches it even when the
+# manifest path is relative-looking, and the import line survives `as`-renaming.
+_MANIFEST_REGEN_RE = re.compile(r"\bbuild_manifest\b|\bdata\.manifest\b")
 
 
 def scan_diff_for_exploit_patterns(patch_text: str) -> list[tuple[str, str]]:
@@ -310,6 +316,8 @@ def scan_diff_for_exploit_patterns(patch_text: str) -> list[tuple[str, str]]:
             hits.append(("references an external/host path (off-protocol input injection)", body[:200]))
         elif _WEIGHT_LOAD_RE.search(body) and _ABS_WEIGHT_PATH_RE.search(body):
             hits.append(("loads model weights from an absolute path (recipe must train from scratch)", body[:200]))
+        elif _MANIFEST_REGEN_RE.search(body):
+            hits.append(("regenerates the data manifest at runtime (data-lock bypass)", body[:200]))
     return hits
 
 
