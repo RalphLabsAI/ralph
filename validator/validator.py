@@ -17,7 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -45,6 +48,7 @@ from validator.integrity import (
     check_canonical_data_source,
     check_compute_plausibility,
     check_recipe_config_matches_proof,
+    check_training_timing,
 )
 
 # Hard-coded sanity bounds for the miner-submitted model config. The validator
@@ -171,6 +175,43 @@ def _safe_load_checkpoint_weights(ckpt_path: Path, expected_keys: set[str] | Non
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"checkpoint['model'] is not a dict: {type(state_dict).__name__}")
     return state_dict
+
+
+def _git_commit_epoch(repo_dir: str) -> float | None:
+    """Unix commit time (UTC seconds) of HEAD in repo_dir, or None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_dir, "show", "-s", "--format=%ct", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return float(out.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _canonical_code_epoch() -> float | None:
+    """Wall-clock epoch the attested canonical code was 'born' — the commit time of
+    the PINNED canonical recipe (RECIPE_DIR HEAD), or RALPH_CANONICAL_CODE_EPOCH if
+    set. Anchored to the pinned recipe (not ralph HEAD) so validator-only deploys
+    don't reset the clock and retro-invalidate honest in-flight runs; only a
+    measurement cutover re-pins RECIPE_DIR. Used by the training-timing gate."""
+    env = os.environ.get("RALPH_CANONICAL_CODE_EPOCH", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    try:
+        from ralph_bootstrap import RECIPE_DIR
+
+        return _git_commit_epoch(str(RECIPE_DIR))
+    except Exception:  # noqa: BLE001 — bootstrap/git failure -> gate skips (fail-open)
+        return None
 
 
 def op1_diff_and_integrity(
@@ -325,6 +366,22 @@ def op1_diff_and_integrity(
         ok_c, detail_c = check_compute_plausibility(final_state, calibration)
         if not ok_c:
             return False, detail_c
+        # Off-protocol training: a checkpoint attesting to the canonical code cannot
+        # have trained longer than that code has existed. Pairs with the MFU gate
+        # above (too-long wall_clock here, too-short there). Disable: RALPH_TIMING_GATE_OFF=1.
+        if os.environ.get("RALPH_TIMING_GATE_OFF") != "1":
+            try:
+                _slack = float(os.environ.get("RALPH_TIMING_SLACK_S") or 7200.0)
+            except ValueError:
+                _slack = 7200.0
+            ok_t, detail_t = check_training_timing(
+                final_state,
+                canonical_code_epoch=_canonical_code_epoch(),
+                now_epoch=time.time(),
+                slack_s=_slack,
+            )
+            if not ok_t:
+                return False, detail_t
         ok_d, detail_d = check_canonical_data_source(final_state)
         if not ok_d:
             return False, detail_d

@@ -151,6 +151,54 @@ def check_compute_plausibility(
     return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
 
 
+# --- Training-timing plausibility (anti off-protocol-training) -----------------
+#
+# op2 attestation proves the canonical recipe/runner CODE was present in the
+# enclave (container_measurement) and that the bundle is BOUND to it (report_data),
+# but NOT that the code EXECUTED to produce the checkpoint. A miner with real CC
+# hardware can train a model OFF-PROTOCOL (own box, any data/compute, no data-lock,
+# no step/compute gate), then spin up the canonical container and mint an
+# attestation over the pre-trained checkpoint + a fabricated final_state.
+#
+# The physical tell: a checkpoint that attests to the canonical code cannot have
+# been trained for longer than that code has EXISTED. If the declared wall_clock_s
+# exceeds the wall-clock time elapsed since the canonical code was committed, the
+# run necessarily started before this code existed -> it was produced off-protocol
+# and the enclave only attested a pre-trained model. Pairs with
+# check_compute_plausibility: too-LONG wall_clock trips THIS gate; too-SHORT trips
+# the MFU gate. Together they box in the off-protocol class (a real model needs
+# real FLOPs => a minimum wall_clock the window cannot contain).
+def check_training_timing(
+    final_state: dict,
+    *,
+    canonical_code_epoch: float | None,
+    now_epoch: float,
+    slack_s: float = 7200.0,
+) -> tuple[bool, str]:
+    """Reject a checkpoint whose declared training duration exceeds the lifetime of
+    the canonical code it attests to. Best-effort: skipped (ok) when the canonical
+    code epoch is unknown or no wall_clock_s is declared. Returns (ok, reason);
+    ok=False -> reject as off-protocol."""
+    fs = final_state or {}
+    if canonical_code_epoch is None:
+        return True, "timing: unknown canonical code epoch (skipped)"
+    try:
+        wall = float(fs.get("wall_clock_s", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "timing: non-numeric wall_clock_s (skipped)"
+    if wall <= 0:
+        return True, "timing: no declared wall_clock_s (skipped)"
+    code_age = float(now_epoch) - float(canonical_code_epoch)
+    if wall > code_age + slack_s:
+        return False, (
+            f"off-protocol training: declared wall_clock_s={wall:,.0f}s ({wall / 3600:.1f}h) "
+            f"exceeds canonical code age {code_age:,.0f}s ({code_age / 3600:.1f}h, "
+            f"+{slack_s / 3600:.1f}h slack) — the attested canonical recipe is younger than "
+            f"the claimed run, so the checkpoint was trained before this code existed"
+        )
+    return True, f"timing plausible: wall {wall / 3600:.1f}h <= code age {code_age / 3600:.1f}h"
+
+
 def _added_config_jsons(patch_text: str) -> list[dict]:
     """Parse every NEW/whole configs/*.json the patch adds (best-effort)."""
     import json
