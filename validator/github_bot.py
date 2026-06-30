@@ -236,11 +236,26 @@ def _latest_recipe_tag(token: str, repo: str = RECIPE_REPO) -> tuple[int, int, i
     return best
 
 
+# Canonical recipe series (MAJOR.MINOR). PATCH auto-increments per king crowning
+# within the series; bump this on a measurement/canonical CUTOVER (container_
+# measurement changes and miners must rebuild) to open a fresh minor line. v0.2
+# ran from #553; v0.3 opens at the --data-base-dir pin cutover (measurement
+# 69d0c098...). MAJOR is reserved for a full protocol reset.
+_RECIPE_SERIES = "0.3"
+
+
+def _version_for(latest: tuple[int, int, int], series: str) -> str:
+    """Pure policy: PATCH within the active series, .0 when the series advances
+    (a cutover the owner declared by bumping _RECIPE_SERIES)."""
+    major, minor, patch = latest
+    want_major, want_minor = (int(x) for x in series.split("."))
+    if (major, minor) != (want_major, want_minor):
+        return f"recipe-v{want_major}.{want_minor}.0"
+    return f"recipe-v{want_major}.{want_minor}.{patch + 1}"
+
+
 def _next_recipe_version(token: str, repo: str = RECIPE_REPO) -> str:
-    major, minor, patch = _latest_recipe_tag(token, repo)
-    if (major, minor, patch) == (0, 0, 0):
-        return "recipe-v0.1.0"
-    return f"recipe-v{major}.{minor}.{patch + 1}"
+    return _version_for(_latest_recipe_tag(token, repo), _RECIPE_SERIES)
 
 
 @dataclass
