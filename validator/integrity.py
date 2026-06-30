@@ -211,20 +211,29 @@ def check_recipe_config_matches_proof(patch_text: str, final_state: dict) -> tup
 # (the run trained on the miner's own data, possibly contaminated with the
 # held-out, then claimed the canonical recipe). The in-the-wild case:
 # manifest_path="/home/root/diony/recipe/data/data_manifest.json".
-_HOST_DATA_PATH_RE = re.compile(r"^\s*(?:~|\.\.)?/(?:home|root|mnt|media|srv|scratch|Users)\b")
+# ALLOWLIST, not blocklist: canonical data lives at a container-RELATIVE path
+# (e.g. "data/data_manifest.json"), resolved inside the proof container against the
+# canonical recipe tree. ANY absolute path ("/..."), home ("~"), or parent-escape
+# ("..") points outside that tree to a miner-controlled location = a data-lock
+# bypass, regardless of the specific prefix. The old per-prefix blocklist
+# (/home|/mnt|...) missed /dstack; this matches every absolute/escaping path by
+# construction, so there is no prefix left to enumerate around.
+_NONCANONICAL_PATH_RE = re.compile(r"^\s*(?:~|\.\.|/)")
 
 
 def check_canonical_data_source(final_state: dict) -> tuple[bool, str]:
-    """Reject a bundle whose training config points the data manifest/dir at a
-    miner-host path. NOTE: this lives in `final_state.config`, NOT the patch diff,
-    so the restricted/exploit patch scanners miss it — op1 must check it here.
-    Best-effort: skipped when there is no config. Returns (ok, reason)."""
+    """Reject a bundle whose training config points the data manifest/dir outside
+    the canonical container-relative data tree. NOTE: this lives in
+    `final_state.config`, NOT the patch diff, so the restricted/exploit patch
+    scanners miss it — op1 must check it here. Best-effort: skipped when there is
+    no config. Returns (ok, reason)."""
     cfg = (final_state or {}).get("config") or {}
     for key in ("manifest_path", "data_base_dir", "data_dir", "data_path"):
         v = cfg.get(key)
-        if isinstance(v, str) and _HOST_DATA_PATH_RE.match(v):
+        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(v):
             return False, (
-                f"non-canonical data source: config.{key}={v!r} is a miner-host path — "
-                f"the run bypassed the locked canonical data_manifest"
+                f"non-canonical data source: config.{key}={v!r} is not a "
+                f"container-relative path — canonical data is the relative data/ "
+                f"tree; any absolute/escaping path bypasses the locked data_manifest"
             )
     return True, "canonical data source"

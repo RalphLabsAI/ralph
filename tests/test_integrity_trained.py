@@ -77,6 +77,19 @@ def test_rejects_mnt_data_base_dir():
     assert not check_canonical_data_source({"config": {"data_base_dir": "/mnt/scratch/SN40/data_50b"}})[0]
 
 
+def test_rejects_dstack_manifest_crazy_m1ner():
+    # The live /dstack bypass the old prefix blocklist (/home|/mnt|...) missed.
+    mp = "/dstack/persistent/canon/recipe/data/data_manifest.json"
+    ok, reason = check_canonical_data_source({"config": {"manifest_path": mp}})
+    assert not ok and "non-canonical data source" in reason
+
+
+def test_rejects_any_absolute_or_escaping_path():
+    # Allowlist: nothing absolute/escaping passes, no matter the prefix.
+    for p in ("/anything/at/all/manifest.json", "~/data/manifest.json", "../../escape/manifest.json"):
+        assert not check_canonical_data_source({"config": {"manifest_path": p}})[0], p
+
+
 def test_accepts_canonical_relative_data_path_7fd43cef():
     fs = {"config": {"manifest_path": "data/data_manifest.json", "data_base_dir": "data"}}
     assert check_canonical_data_source(fs)[0]
@@ -128,3 +141,20 @@ def test_bpb_inversion_roundtrips():
 def test_rejects_non_finite_and_bad_vocab():
     assert not check_checkpoint_trained(float("nan"), VOCAB)[0]
     assert not check_checkpoint_trained(3.5, 1)[0]
+
+
+# --- patch scan: manifest regeneration (mechanism-based, path-agnostic) -------
+def test_patch_scan_flags_build_manifest_regen():
+    from proof.runner import scan_diff_for_exploit_patterns
+    patch = (
+        "+++ b/recipe/train.py\n"
+        "+        from data.manifest import build_manifest\n"
+        "+        build_manifest('x', 'gpt2', 50257, 'uint16', shards, base).write(_mpath)\n"
+    )
+    assert any("data manifest at runtime" in r for r, _ in scan_diff_for_exploit_patterns(patch))
+
+
+def test_patch_scan_clean_model_change_passes():
+    from proof.runner import scan_diff_for_exploit_patterns
+    patch = "+++ b/model/gpt.py\n+    self.norm = RMSNorm(dim)\n+    x = self.norm(x)\n"
+    assert scan_diff_for_exploit_patterns(patch) == []
