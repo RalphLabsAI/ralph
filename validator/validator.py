@@ -256,6 +256,13 @@ def op1_diff_and_integrity(
         ("checkpoint", proof_dir / "training" / "checkpoint.pt", manifest.get("checkpoint_sha256")),
         ("training_log", proof_dir / "training" / "training_log.jsonl", manifest.get("training_log_sha256")),
         ("calibration", proof_dir / "calibration.json", manifest.get("calibration_sha256")),
+        # final_state is REQUIRED. The anti-gaming gates (compute/timing/data/config)
+        # all read final_state.config, and the runner folds final_state into bundle_hash
+        # UNCONDITIONALLY (proof.runner). If a bundle could omit it, the validator would
+        # (a) skip every gate (the `if fs_path.exists()` block below) and (b) recompute a
+        # 4-component hash that still self-consistently matches a tampered submission —
+        # a one-file bypass of the entire anti-gaming surface. Requiring it here closes that.
+        ("final_state", proof_dir / "training" / "final_state.json", manifest.get("final_state_sha256")),
     ]
     # Attestation is now required (single attested-execution tier).
     if manifest.get("attestation_sha256"):
@@ -286,9 +293,9 @@ def op1_diff_and_integrity(
     bundle_components.append(_file_sha256(proof_dir / "training" / "checkpoint.pt").encode())
     bundle_components.append(_file_sha256(proof_dir / "training" / "training_log.jsonl").encode())
     bundle_components.append(_file_sha256(proof_dir / "calibration.json").encode())
-    fs_path = proof_dir / "training" / "final_state.json"
-    if fs_path.exists():
-        bundle_components.append(_file_sha256(fs_path).encode())
+    # final_state is guaranteed present by the required-artifact loop above, so append
+    # it unconditionally — matching proof.runner's unconditional 5-component hash.
+    bundle_components.append(_file_sha256(proof_dir / "training" / "final_state.json").encode())
     recomputed = hashlib.sha256(b"".join(bundle_components)).hexdigest()
     if submission_payload.get("bundle_hash") != recomputed:
         return False, (
