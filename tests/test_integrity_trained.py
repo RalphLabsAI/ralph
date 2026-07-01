@@ -28,7 +28,7 @@ def test_timing_rejects_run_longer_than_canonical_code_age():
 
 def test_timing_accepts_run_within_code_age():
     fs = {"wall_clock_s": 21600.0}  # 6h, code existed 8h
-    assert check_training_timing(fs, canonical_code_epoch=1_000_000.0, now_epoch=1_000_000.0 + 8 * 3600, slack_s=7200)[0]
+    assert check_training_timing(fs, canonical_code_epoch=1e6, now_epoch=1e6 + 8 * 3600, slack_s=7200)[0]
 
 
 def test_timing_skips_without_wall_clock_or_epoch():
