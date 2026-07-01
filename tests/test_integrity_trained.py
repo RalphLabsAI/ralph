@@ -12,6 +12,7 @@ from validator.integrity import (
     check_checkpoint_trained,
     check_compute_budget,
     check_compute_plausibility,
+    check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
     compare_loss_trajectory,
