@@ -198,21 +198,30 @@ def test_config_match_skips_when_no_config_or_no_steps():
 
 
 # --- canonical data source (anti data-lock-bypass) ---------------------------
-def test_rejects_noncanonical_host_manifest_ea576b0a():
-    fs = {"config": {"manifest_path": "/home/root/diony/recipe/data/data_manifest.json", "data_base_dir": "data"}}
-    ok, reason = check_canonical_data_source(fs)
-    assert not ok and "non-canonical data source" in reason
+def test_accepts_container_mount_absolute_data_path():
+    # The canonical runner pins --manifest/--data-base-dir to the RESOLVED-ABSOLUTE
+    # container path (proof/runner.py); train.py records it verbatim. Different CC
+    # containers mount the recipe at different roots (/workspace, /dstack, /home/...),
+    # all ending in the canonical .../data tree — that's the honest bundle (the
+    # runner's own pin), not a swap. They fold to the relative tail and are accepted;
+    # rejecting them was the miner-reported op1 breakage.
+    for mp in (
+        "/workspace/recipe/data/data_manifest.json",
+        "/dstack/persistent/canon/recipe/data/data_manifest.json",
+        "/home/root/diony/recipe/data/data_manifest.json",
+    ):
+        assert check_canonical_data_source({"config": {"manifest_path": mp}})[0], mp
+    assert check_canonical_data_source({"config": {"data_base_dir": "/workspace/recipe/data"}})[0]
 
 
 def test_rejects_mnt_data_base_dir():
+    # No canonical "data" segment -> stays absolute -> rejected.
     assert not check_canonical_data_source({"config": {"data_base_dir": "/mnt/scratch/SN40/data_50b"}})[0]
 
 
-def test_rejects_dstack_manifest_crazy_m1ner():
-    # The live /dstack bypass the old prefix blocklist (/home|/mnt|...) missed.
-    mp = "/dstack/persistent/canon/recipe/data/data_manifest.json"
-    ok, reason = check_canonical_data_source({"config": {"manifest_path": mp}})
-    assert not ok and "non-canonical data source" in reason
+def test_rejects_absolute_path_outside_data_tree():
+    for mp in ("/home/attacker/evil.bin", "/mnt/scratch/other.json"):
+        assert not check_canonical_data_source({"config": {"manifest_path": mp}})[0], mp
 
 
 def test_rejects_any_absolute_or_escaping_path():

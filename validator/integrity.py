@@ -395,35 +395,55 @@ def check_recipe_config_matches_proof(patch_text: str, final_state: dict) -> tup
     return True, "config matches proof"
 
 
-# Miner-host data paths a canonical run must never reference. The locked
-# canonical data_manifest is relative (e.g. "data/data_manifest.json"); a config
-# that points manifest_path/data_base_dir at /home, /mnt, … is a data-lock bypass
-# (the run trained on the miner's own data, possibly contaminated with the
-# held-out, then claimed the canonical recipe). The in-the-wild case:
-# manifest_path="/home/root/diony/recipe/data/data_manifest.json".
-# ALLOWLIST, not blocklist: canonical data lives at a container-RELATIVE path
-# (e.g. "data/data_manifest.json"), resolved inside the proof container against the
-# canonical recipe tree. ANY absolute path ("/..."), home ("~"), or parent-escape
-# ("..") points outside that tree to a miner-controlled location = a data-lock
-# bypass, regardless of the specific prefix. The old per-prefix blocklist
-# (/home|/mnt|...) missed /dstack; this matches every absolute/escaping path by
-# construction, so there is no prefix left to enumerate around.
+# The canonical data_manifest is the container's relative data/ tree. A config
+# pointing manifest_path/data_base_dir at a home ("~") or parent-escape ("..")
+# path is outside that tree — reject.
+#
+# BUT the canonical proof runner (proof/runner.py) intentionally pins
+# --manifest/--data-base-dir to the RESOLVED-ABSOLUTE container path
+# ((RECIPE_DIR/"data"...).resolve()), and recipe train.py records that verbatim
+# into final_state.config. So the honest, canonical output IS an absolute path
+# like "/workspace/recipe/data/data_manifest.json" or "/dstack/.../recipe/data/…".
+# Rejecting every absolute path therefore false-rejects every honest bundle built
+# by the canonical harness (the miner-reported op1 breakage). We fold an absolute
+# path that passes through the canonical "data" tree back to its relative tail
+# ("…/data/data_manifest.json" -> "data/data_manifest.json") before the check, so
+# the runner's own resolved paths pass; ~ home and .. escapes stay rejected.
+# NOTE: this path check is NOT the data-lock security boundary — the runner PINS
+# the load dir (its CLI arg overrides any config the miner sets), and the
+# container filesystem is miner-owned regardless of the string, so a determined
+# swap is only deterred by re-derivation, not by this regex. Its job is only to
+# not false-reject the honest canonical output while flagging obviously-off paths.
 _NONCANONICAL_PATH_RE = re.compile(r"^\s*(?:~|\.\.|/)")
+_CANONICAL_DATA_TAIL_RE = re.compile(r"(?:^|/)(data(?:/.*)?)$")
+
+
+def _canonical_relative_tail(v: str) -> str:
+    """Fold an absolute path that passes through the canonical 'data' tree back to
+    its container-relative tail (…/data or …/data/… -> 'data[/…]'). ~ home and ..
+    escapes are left untouched (they stay rejected by the allowlist)."""
+    s = v.strip()
+    if s.startswith("/"):
+        m = _CANONICAL_DATA_TAIL_RE.search(s)
+        if m:
+            return m.group(1)
+    return s
 
 
 def check_canonical_data_source(final_state: dict) -> tuple[bool, str]:
     """Reject a bundle whose training config points the data manifest/dir outside
-    the canonical container-relative data tree. NOTE: this lives in
-    `final_state.config`, NOT the patch diff, so the restricted/exploit patch
-    scanners miss it — op1 must check it here. Best-effort: skipped when there is
-    no config. Returns (ok, reason)."""
+    the canonical data tree. The canonical runner's RESOLVED-ABSOLUTE paths are
+    folded to their relative tail first (so they pass); only ~/.. escapes and
+    absolute paths with no canonical 'data' segment are rejected. Lives in
+    `final_state.config` (not the patch), so op1 must check it here. Best-effort:
+    skipped when there is no config. Returns (ok, reason)."""
     cfg = (final_state or {}).get("config") or {}
     for key in ("manifest_path", "data_base_dir", "data_dir", "data_path"):
         v = cfg.get(key)
-        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(v):
+        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(_canonical_relative_tail(v)):
             return False, (
-                f"non-canonical data source: config.{key}={v!r} is not a "
-                f"container-relative path — canonical data is the relative data/ "
-                f"tree; any absolute/escaping path bypasses the locked data_manifest"
+                f"non-canonical data source: config.{key}={v!r} does not resolve to the "
+                f"canonical container-relative data/ tree (~/.. escape or an absolute path "
+                f"outside data/) — points at a miner-controlled location"
             )
     return True, "canonical data source"
