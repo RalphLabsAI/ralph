@@ -17,7 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -43,8 +46,10 @@ from proof.runner import _load_restricted_paths, scan_diff_for_exploit_patterns,
 from proof.sources import compute_container_measurement
 from validator.integrity import (
     check_canonical_data_source,
+    check_checkpoint_not_blocklisted,
     check_compute_plausibility,
     check_recipe_config_matches_proof,
+    check_training_timing,
 )
 
 # Hard-coded sanity bounds for the miner-submitted model config. The validator
@@ -173,6 +178,61 @@ def _safe_load_checkpoint_weights(ckpt_path: Path, expected_keys: set[str] | Non
     return state_dict
 
 
+def _git_commit_epoch(repo_dir: str) -> float | None:
+    """Unix commit time (UTC seconds) of HEAD in repo_dir, or None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_dir, "show", "-s", "--format=%ct", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return float(out.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _fraud_checkpoints(ralph_root: Path) -> set:
+    """Load the fraud/off-protocol checkpoint blocklist (chain/fraud_checkpoints.json).
+    Entries may be bare SHA-256 strings or {"checkpoint_sha256": ...} dicts. A missing
+    or malformed file yields an empty set (fail-open)."""
+    p = ralph_root / "chain" / "fraud_checkpoints.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    out: set = set()
+    for e in data if isinstance(data, list) else []:
+        if isinstance(e, str):
+            out.add(e)
+        elif isinstance(e, dict) and isinstance(e.get("checkpoint_sha256"), str):
+            out.add(e["checkpoint_sha256"])
+    return out
+
+
+def _canonical_code_epoch() -> float | None:
+    """Wall-clock epoch the attested canonical code was 'born' — the commit time of
+    the PINNED canonical recipe (RECIPE_DIR HEAD), or RALPH_CANONICAL_CODE_EPOCH if
+    set. Anchored to the pinned recipe (not ralph HEAD) so validator-only deploys
+    don't reset the clock and retro-invalidate honest in-flight runs; only a
+    measurement cutover re-pins RECIPE_DIR. Used by the training-timing gate."""
+    env = os.environ.get("RALPH_CANONICAL_CODE_EPOCH", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    try:
+        from ralph_bootstrap import RECIPE_DIR
+
+        return _git_commit_epoch(str(RECIPE_DIR))
+    except Exception:  # noqa: BLE001 — bootstrap/git failure -> gate skips (fail-open)
+        return None
+
+
 def op1_diff_and_integrity(
     ralph_root: Path,
     submission_payload: dict,
@@ -215,6 +275,13 @@ def op1_diff_and_integrity(
         ("checkpoint", proof_dir / "training" / "checkpoint.pt", manifest.get("checkpoint_sha256")),
         ("training_log", proof_dir / "training" / "training_log.jsonl", manifest.get("training_log_sha256")),
         ("calibration", proof_dir / "calibration.json", manifest.get("calibration_sha256")),
+        # final_state is REQUIRED. The anti-gaming gates (compute/timing/data/config)
+        # all read final_state.config, and the runner folds final_state into bundle_hash
+        # UNCONDITIONALLY (proof.runner). If a bundle could omit it, the validator would
+        # (a) skip every gate (the `if fs_path.exists()` block below) and (b) recompute a
+        # 4-component hash that still self-consistently matches a tampered submission —
+        # a one-file bypass of the entire anti-gaming surface. Requiring it here closes that.
+        ("final_state", proof_dir / "training" / "final_state.json", manifest.get("final_state_sha256")),
     ]
     # Attestation is now required (single attested-execution tier).
     if manifest.get("attestation_sha256"):
@@ -233,6 +300,15 @@ def op1_diff_and_integrity(
         if actual != expected:
             return False, f"{name} hash mismatch (expected {expected[:8]}, got {actual[:8]})"
 
+    # Fraud-checkpoint blocklist: reject re-submission of a checkpoint previously
+    # dethroned as off-protocol/fabricated (identical model, new bundle hash +
+    # adjusted metadata). manifest['checkpoint_sha256'] is authenticated by the loop above.
+    ok_bl, detail_bl = check_checkpoint_not_blocklisted(
+        manifest.get("checkpoint_sha256"), _fraud_checkpoints(ralph_root)
+    )
+    if not ok_bl:
+        return False, detail_bl
+
     # Recompute bundle_hash from disk and require it match BOTH the
     # submission's signed-over hash AND the manifest's declared bundle hash.
     # The recipe for bundle_hash is the same as in proof.runner.run_proof_test.
@@ -245,9 +321,9 @@ def op1_diff_and_integrity(
     bundle_components.append(_file_sha256(proof_dir / "training" / "checkpoint.pt").encode())
     bundle_components.append(_file_sha256(proof_dir / "training" / "training_log.jsonl").encode())
     bundle_components.append(_file_sha256(proof_dir / "calibration.json").encode())
-    fs_path = proof_dir / "training" / "final_state.json"
-    if fs_path.exists():
-        bundle_components.append(_file_sha256(fs_path).encode())
+    # final_state is guaranteed present by the required-artifact loop above, so append
+    # it unconditionally — matching proof.runner's unconditional 5-component hash.
+    bundle_components.append(_file_sha256(proof_dir / "training" / "final_state.json").encode())
     recomputed = hashlib.sha256(b"".join(bundle_components)).hexdigest()
     if submission_payload.get("bundle_hash") != recomputed:
         return False, (
@@ -325,6 +401,22 @@ def op1_diff_and_integrity(
         ok_c, detail_c = check_compute_plausibility(final_state, calibration)
         if not ok_c:
             return False, detail_c
+        # Off-protocol training: a checkpoint attesting to the canonical code cannot
+        # have trained longer than that code has existed. Pairs with the MFU gate
+        # above (too-long wall_clock here, too-short there). Disable: RALPH_TIMING_GATE_OFF=1.
+        if os.environ.get("RALPH_TIMING_GATE_OFF") != "1":
+            try:
+                _slack = float(os.environ.get("RALPH_TIMING_SLACK_S") or 7200.0)
+            except ValueError:
+                _slack = 7200.0
+            ok_t, detail_t = check_training_timing(
+                final_state,
+                canonical_code_epoch=_canonical_code_epoch(),
+                now_epoch=time.time(),
+                slack_s=_slack,
+            )
+            if not ok_t:
+                return False, detail_t
         ok_d, detail_d = check_canonical_data_source(final_state)
         if not ok_d:
             return False, detail_d
@@ -1204,6 +1296,139 @@ def _legacy_hidden_eval(
     return _run_eval_subprocess(RECIPE_DIR, ckpt_path, ralph_root, "canonical-eval")
 
 
+def _read_training_log_points(log_path: Path, max_step: int | None = None) -> list:
+    """Parse (step, loss) points from a training_log.jsonl, up to max_step (inclusive)."""
+    out: list = []
+    try:
+        for ln in log_path.read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            e = json.loads(ln)
+            s = int(e["step"])
+            if max_step is not None and s > max_step:
+                break
+            out.append((s, float(e["loss"])))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return out
+
+
+def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str]:
+    """Pre-crown proof-of-EXECUTION: re-run the FIRST few steps of the declared
+    training on CANONICAL data and require the loss trajectory to reproduce.
+
+    op2 attests code PRESENCE, not EXECUTION; the timing gate + fraud blocklist only
+    raise the cost of off-protocol training. This is the check that actually proves the
+    declared run happened: apply the miner's patch to the canonical recipe, run the real
+    train.py with the miner's exact config+seed but pinned to CANONICAL data, collect the
+    first few logged points, and compare the trajectory (validator.integrity.compare_loss_trajectory).
+
+    OFF by default (RALPH_REDERIVE=1 to enable). Fail-OPEN (skip) when disabled or when the
+    canonical training data is not materialized on the validator — enable only AFTER
+    materializing data/data_manifest.json + shards and calibrating the tolerance band on a
+    known-honest bundle. Expensive (GPU-minutes); the caller should run it only on a bundle
+    that would actually beat the king. NOTE: written but UNVALIDATED until canonical data
+    exists on a validator to run it against.
+    """
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    if os.environ.get("RALPH_REDERIVE") != "1":
+        return True, "re-derivation disabled (RALPH_REDERIVE!=1)"
+    from ralph_bootstrap import RECIPE_DIR
+
+    canon_manifest = RECIPE_DIR / "data" / "data_manifest.json"
+    if not canon_manifest.exists():
+        return True, "re-derivation skipped: canonical data_manifest.json not materialized on validator"
+
+    fs_path = proof_dir / "training" / "final_state.json"
+    log_path = proof_dir / "training" / "training_log.jsonl"
+    if not (fs_path.exists() and log_path.exists()):
+        return True, "re-derivation skipped: missing final_state/training_log"
+    try:
+        cfg = (json.loads(fs_path.read_text()).get("config")) or {}
+    except (OSError, ValueError):
+        return True, "re-derivation skipped: unreadable final_state"
+
+    n_points = int(os.environ.get("RALPH_REDERIVE_POINTS", "3"))
+    log_every = int(cfg.get("log_every", 50) or 50)
+    max_step = log_every * (n_points - 1)
+    declared = _read_training_log_points(log_path, max_step=max_step)
+    if len(declared) < 2:
+        return True, "re-derivation skipped: declared log too short to compare"
+
+    from proof.runner import _sanitized_env, apply_patch
+
+    patch_path = proof_dir / "patch.diff"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        workdir = tmp_p / "workdir"
+        for sub in ("model", "recipe", "data", "configs"):
+            src = RECIPE_DIR / sub
+            if src.exists():
+                shutil.copytree(src, workdir / sub, dirs_exist_ok=True)
+        try:
+            if patch_path.exists():
+                apply_patch(workdir, patch_path)
+        except Exception as e:  # noqa: BLE001
+            return False, f"re-derivation: patch apply failed: {str(e)[:150]}"
+
+        # Reproduce the miner's exact config (hence LR schedule) but pin data to canonical.
+        cfg_file = tmp_p / "rederive_config.json"
+        cfg_file.write_text(json.dumps(cfg))
+        out_dir = tmp_p / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rlog = out_dir / "training_log.jsonl"
+        train_py = workdir / "recipe" / "train.py"
+        if not train_py.exists():
+            return True, "re-derivation skipped: recipe/train.py not found in workdir"
+        cmd = [
+            sys.executable, str(train_py),
+            "--config", str(cfg_file),
+            "--manifest", str(canon_manifest.resolve()),
+            "--data-base-dir", str((RECIPE_DIR / "data").resolve()),
+            "--out-dir", str(out_dir),
+        ]
+        seed = cfg.get("init_seed", cfg.get("data_seed"))
+        if seed is not None:
+            cmd += ["--seed", str(int(seed))]
+
+        env = _sanitized_env(extra={"PYTHONPATH": str(workdir)})
+        timeout_s = int(os.environ.get("RALPH_REDERIVE_TIMEOUT_S", "1200"))
+        proc = subprocess.Popen(cmd, cwd=str(workdir), env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Watch the log until the target step is written (schedule preserved, we just
+        # stop early), then terminate — a faithful partial re-run, not a full retrain.
+        start = time.time()
+        rederived: list = []
+        try:
+            while time.time() - start < timeout_s:
+                if rlog.exists():
+                    rederived = _read_training_log_points(rlog, max_step=max_step)
+                    if rederived and max(s for s, _ in rederived) >= max_step:
+                        break
+                if proc.poll() is not None:  # train.py finished (ran fewer than max_step)
+                    rederived = _read_training_log_points(rlog, max_step=max_step)
+                    break
+                time.sleep(2)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        if len(rederived) < 2:
+            return True, f"re-derivation inconclusive: only {len(rederived)} point(s) produced in {timeout_s}s (skip)"
+
+    from validator.integrity import compare_loss_trajectory
+    return compare_loss_trajectory(declared, rederived)
+
+
 def op4_hidden_eval(
     ralph_root: Path,
     proof_dir: Path,
@@ -1295,6 +1520,19 @@ def judge_submission(
     result.operations["op3_log_plausibility"] = {"ok": ok, "detail": detail}
     if not ok:
         result.rejected = ValidatorReject("op3_log_plausibility", detail)
+        return result
+
+    # Pre-crown proof-of-EXECUTION (OFF by default; RALPH_REDERIVE=1). Re-runs the
+    # first training steps on CANONICAL data and requires the loss trajectory to
+    # reproduce — the only check that off-protocol training can't satisfy without
+    # actually running the canonical recipe. Skips cleanly when disabled or when the
+    # canonical data isn't materialized. Expensive: for efficiency the crown path
+    # should ideally invoke this only for a bundle that would beat the king (it still
+    # short-circuits behind op1-op3 here).
+    ok, detail = op_rederive_trajectory(ralph_root, proof_dir)
+    result.operations["op_rederive"] = {"ok": ok, "detail": detail}
+    if not ok:
+        result.rejected = ValidatorReject("op_rederive_trajectory", detail)
         return result
 
     ok, detail, hidden_eval = op4_hidden_eval(ralph_root, proof_dir, chain=chain)

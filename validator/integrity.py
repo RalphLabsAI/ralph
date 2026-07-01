@@ -151,6 +151,144 @@ def check_compute_plausibility(
     return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
 
 
+# --- Training-timing plausibility (anti off-protocol-training) -----------------
+#
+# op2 attestation proves the canonical recipe/runner CODE was present in the
+# enclave (container_measurement) and that the bundle is BOUND to it (report_data),
+# but NOT that the code EXECUTED to produce the checkpoint. A miner with real CC
+# hardware can train a model OFF-PROTOCOL (own box, any data/compute, no data-lock,
+# no step/compute gate), then spin up the canonical container and mint an
+# attestation over the pre-trained checkpoint + a fabricated final_state.
+#
+# The physical tell: a checkpoint that attests to the canonical code cannot have
+# been trained for longer than that code has EXISTED. If the declared wall_clock_s
+# exceeds the wall-clock time elapsed since the canonical code was committed, the
+# run necessarily started before this code existed -> it was produced off-protocol
+# and the enclave only attested a pre-trained model. Pairs with
+# check_compute_plausibility: too-LONG wall_clock trips THIS gate; too-SHORT trips
+# the MFU gate. Together they box in the off-protocol class (a real model needs
+# real FLOPs => a minimum wall_clock the window cannot contain).
+def check_training_timing(
+    final_state: dict,
+    *,
+    canonical_code_epoch: float | None,
+    now_epoch: float,
+    slack_s: float = 7200.0,
+) -> tuple[bool, str]:
+    """Reject a checkpoint whose declared training duration exceeds the lifetime of
+    the canonical code it attests to. Best-effort: skipped (ok) when the canonical
+    code epoch is unknown or no wall_clock_s is declared. Returns (ok, reason);
+    ok=False -> reject as off-protocol."""
+    fs = final_state or {}
+    if canonical_code_epoch is None:
+        return True, "timing: unknown canonical code epoch (skipped)"
+    try:
+        wall = float(fs.get("wall_clock_s", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "timing: non-numeric wall_clock_s (skipped)"
+    if wall <= 0:
+        return True, "timing: no declared wall_clock_s (skipped)"
+    code_age = float(now_epoch) - float(canonical_code_epoch)
+    if wall > code_age + slack_s:
+        return False, (
+            f"off-protocol training: declared wall_clock_s={wall:,.0f}s ({wall / 3600:.1f}h) "
+            f"exceeds canonical code age {code_age:,.0f}s ({code_age / 3600:.1f}h, "
+            f"+{slack_s / 3600:.1f}h slack) — the attested canonical recipe is younger than "
+            f"the claimed run, so the checkpoint was trained before this code existed"
+        )
+    return True, f"timing plausible: wall {wall / 3600:.1f}h <= code age {code_age / 3600:.1f}h"
+
+
+def check_checkpoint_not_blocklisted(checkpoint_sha256: str | None, blocked: set) -> tuple[bool, str]:
+    """Reject a checkpoint whose SHA-256 was previously dethroned as fraud/off-protocol.
+
+    Stopgap against re-submitting the IDENTICAL off-protocol model under a fresh
+    bundle hash + adjusted final_state metadata. The timing gate weakens as the
+    canonical code ages (a 7h claim becomes "possible" 7h after the cutover), so an
+    unchanged fraud checkpoint can otherwise be re-crowned by simply waiting. The
+    caller passes manifest['checkpoint_sha256'], which is authenticated against the
+    on-disk checkpoint by the artifact-integrity loop. Returns (ok, reason)."""
+    if isinstance(checkpoint_sha256, str) and checkpoint_sha256 in blocked:
+        return False, (
+            f"blocklisted checkpoint {checkpoint_sha256[:16]}… — this exact model was "
+            f"previously dethroned as off-protocol/fabricated; re-derive on the canonical "
+            f"code to resubmit"
+        )
+    return True, "checkpoint not blocklisted"
+
+
+# --- Pre-crown re-derivation (proof of EXECUTION, not just presence) -----------
+#
+# op2 attests that the canonical code was PRESENT; nothing proves it EXECUTED to
+# produce the checkpoint. The timing gate + fraud blocklist raise the cost but a
+# patient attacker retrains a fresh off-protocol checkpoint and waits out the
+# timing window. The only check that proves the declared run actually happened is
+# to RE-RUN a slice of it: apply the miner's patch to the canonical recipe, run the
+# real train.py for the first N steps on CANONICAL data with the miner's config +
+# seed, and compare the re-derived per-step loss trajectory against the declared
+# training_log.jsonl.
+#
+# Why it works: the step-0 loss (init-seed weights forward on the first canonical
+# batch) is a near-deterministic FINGERPRINT of (arch, seed, data) — an off-protocol
+# run on different data/arch, or a fabricated log, misses it. The next few logged
+# points can't be reproduced without actually running the canonical optimizer on
+# canonical data, so faking them == honestly training (the attacker gains nothing).
+# Coverage limit: partial re-derivation proves the run STARTED honestly; a
+# "run N canonical steps then swap the final checkpoint" attack needs the attacker
+# to actually run N canonical steps AND the swapped checkpoint still faces op4 — it
+# raises cost sharply but only full re-derivation closes it completely.
+def compare_loss_trajectory(
+    declared,
+    rederived,
+    *,
+    step0_tol: float = 0.10,
+    abs_tol: float = 0.40,
+    rel_tol: float = 0.10,
+    min_points: int = 2,
+) -> tuple[bool, str]:
+    """Compare a declared vs a re-derived training-loss trajectory.
+
+    Args:
+      declared/rederived: iterables of (step, loss), matched by step number.
+      step0_tol: tight band for the step-0 fingerprint (init forward, deterministic).
+      abs_tol/rel_tol: looser band for later steps (benign GPU/compile nondeterminism);
+        a step passes if |declared - rederived| <= max(abs_tol, rel_tol*|declared|).
+      min_points: minimum matched steps required to render a verdict.
+
+    Returns (ok, reason). ok=False => the declared run was not reproduced on canonical
+    data (off-protocol / fabricated log)."""
+    dd = {int(s): float(v) for s, v in declared if v == v}  # drop NaN
+    rr = {int(s): float(v) for s, v in rederived if v == v}
+    common = sorted(set(dd) & set(rr))
+    if len(common) < min_points:
+        return False, (
+            f"re-derivation produced too few comparable points ({len(common)} < {min_points}) "
+            f"— cannot confirm the declared training ran on canonical code/data"
+        )
+    # Step-0 fingerprint: init-seed weights forwarded on the first canonical batch.
+    # A miss here means different arch/seed/data than the canonical recipe.
+    if 0 in common and abs(dd[0] - rr[0]) > step0_tol:
+        return False, (
+            f"re-derivation mismatch at step 0: declared loss {dd[0]:.3f} vs re-derived "
+            f"{rr[0]:.3f} (tol {step0_tol:.2f}) — different init/data/arch than the canonical "
+            f"recipe: the checkpoint was trained off-protocol or the log is fabricated"
+        )
+    fails = []
+    for s in common:
+        tol = step0_tol if s == 0 else max(abs_tol, rel_tol * abs(dd[s]))
+        if abs(dd[s] - rr[s]) > tol:
+            fails.append((s, dd[s], rr[s], tol))
+    # Tolerate a single noisy point; a majority outside band = systematic divergence.
+    if len(fails) > max(0, (len(common) - 1) // 2):
+        s, d, r, t = fails[0]
+        return False, (
+            f"re-derivation trajectory mismatch: {len(fails)}/{len(common)} steps outside band "
+            f"(e.g. step {s}: declared {d:.3f} vs re-derived {r:.3f}, tol {t:.2f}) — the declared "
+            f"training was not reproduced on canonical data (off-protocol)"
+        )
+    return True, f"re-derivation reproduced {len(common) - len(fails)}/{len(common)} trajectory points"
+
+
 def _added_config_jsons(patch_text: str) -> list[dict]:
     """Parse every NEW/whole configs/*.json the patch adds (best-effort)."""
     import json
