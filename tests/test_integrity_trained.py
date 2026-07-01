@@ -8,11 +8,77 @@ import pytest
 
 from validator.integrity import (
     check_canonical_data_source,
+    check_checkpoint_not_blocklisted,
     check_checkpoint_trained,
     check_compute_plausibility,
     check_recipe_config_matches_proof,
+    check_training_timing,
+    compare_loss_trajectory,
     nats_per_token_from_bpb,
 )
+
+
+# --- training-timing gate (anti off-protocol) --------------------------------
+def test_timing_rejects_run_longer_than_canonical_code_age():
+    # aa427cd1/6a25bdc8: ~6.95h wall_clock but the canonical code was ~2h old.
+    fs = {"wall_clock_s": 25011.0}
+    ok, reason = check_training_timing(fs, canonical_code_epoch=1_000_000.0, now_epoch=1_000_000.0 + 7380, slack_s=7200)
+    assert not ok and "off-protocol" in reason
+
+
+def test_timing_accepts_run_within_code_age():
+    fs = {"wall_clock_s": 21600.0}  # 6h, code existed 8h
+    assert check_training_timing(fs, canonical_code_epoch=1_000_000.0, now_epoch=1_000_000.0 + 8 * 3600, slack_s=7200)[0]
+
+
+def test_timing_skips_without_wall_clock_or_epoch():
+    assert check_training_timing({"wall_clock_s": 0}, canonical_code_epoch=1e6, now_epoch=1e6 + 10, slack_s=7200)[0]
+    assert check_training_timing({"wall_clock_s": 9e9}, canonical_code_epoch=None, now_epoch=1e6, slack_s=7200)[0]
+
+
+# --- fraud-checkpoint blocklist ----------------------------------------------
+def test_blocklist_rejects_known_fraud_checkpoint():
+    fraud = "f06a9090548978a1987c2b3ada48746348d8134e68f598e0be982e4d5f26f7ab"
+    ok, reason = check_checkpoint_not_blocklisted(fraud, {fraud})
+    assert not ok and "blocklisted" in reason
+
+
+def test_blocklist_passes_unknown_and_none():
+    assert check_checkpoint_not_blocklisted("d" * 64, {"a" * 64})[0]
+    assert check_checkpoint_not_blocklisted(None, {"a" * 64})[0]
+    assert check_checkpoint_not_blocklisted("a" * 64, set())[0]
+
+
+# --- pre-crown re-derivation trajectory compare ------------------------------
+_HONEST = [(0, 11.02), (50, 6.77), (100, 5.78), (150, 5.20)]
+
+
+def test_rederive_accepts_matching_trajectory():
+    assert compare_loss_trajectory(_HONEST, [(0, 11.03), (50, 6.80), (100, 5.75), (150, 5.24)])[0]
+
+
+def test_rederive_rejects_fabricated_trajectory():
+    ok, reason = compare_loss_trajectory(_HONEST, [(0, 11.0), (50, 8.9), (100, 8.1), (150, 7.6)])
+    assert not ok and "trajectory mismatch" in reason
+
+
+def test_rederive_rejects_offprotocol_faster_drop():
+    # A different (e.g. bigger) off-protocol model / different data drops differently.
+    ok, reason = compare_loss_trajectory(_HONEST, [(0, 11.01), (50, 5.1), (100, 4.0), (150, 3.4)])
+    assert not ok
+
+
+def test_rederive_rejects_step0_fingerprint_mismatch():
+    ok, reason = compare_loss_trajectory(_HONEST, [(0, 9.8), (50, 6.8), (100, 5.8), (150, 5.2)])
+    assert not ok and "step 0" in reason
+
+
+def test_rederive_tolerates_one_noisy_point():
+    assert compare_loss_trajectory(_HONEST, [(0, 11.02), (50, 6.77), (100, 6.30), (150, 5.20)])[0]
+
+
+def test_rederive_needs_min_points():
+    assert not compare_loss_trajectory(_HONEST, [(0, 11.0)])[0]
 
 VOCAB = 50257
 RANDOM_NATS = math.log(VOCAB)  # ~10.82

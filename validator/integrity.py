@@ -217,6 +217,78 @@ def check_checkpoint_not_blocklisted(checkpoint_sha256: str | None, blocked: set
     return True, "checkpoint not blocklisted"
 
 
+# --- Pre-crown re-derivation (proof of EXECUTION, not just presence) -----------
+#
+# op2 attests that the canonical code was PRESENT; nothing proves it EXECUTED to
+# produce the checkpoint. The timing gate + fraud blocklist raise the cost but a
+# patient attacker retrains a fresh off-protocol checkpoint and waits out the
+# timing window. The only check that proves the declared run actually happened is
+# to RE-RUN a slice of it: apply the miner's patch to the canonical recipe, run the
+# real train.py for the first N steps on CANONICAL data with the miner's config +
+# seed, and compare the re-derived per-step loss trajectory against the declared
+# training_log.jsonl.
+#
+# Why it works: the step-0 loss (init-seed weights forward on the first canonical
+# batch) is a near-deterministic FINGERPRINT of (arch, seed, data) — an off-protocol
+# run on different data/arch, or a fabricated log, misses it. The next few logged
+# points can't be reproduced without actually running the canonical optimizer on
+# canonical data, so faking them == honestly training (the attacker gains nothing).
+# Coverage limit: partial re-derivation proves the run STARTED honestly; a
+# "run N canonical steps then swap the final checkpoint" attack needs the attacker
+# to actually run N canonical steps AND the swapped checkpoint still faces op4 — it
+# raises cost sharply but only full re-derivation closes it completely.
+def compare_loss_trajectory(
+    declared,
+    rederived,
+    *,
+    step0_tol: float = 0.10,
+    abs_tol: float = 0.40,
+    rel_tol: float = 0.10,
+    min_points: int = 2,
+) -> tuple[bool, str]:
+    """Compare a declared vs a re-derived training-loss trajectory.
+
+    Args:
+      declared/rederived: iterables of (step, loss), matched by step number.
+      step0_tol: tight band for the step-0 fingerprint (init forward, deterministic).
+      abs_tol/rel_tol: looser band for later steps (benign GPU/compile nondeterminism);
+        a step passes if |declared - rederived| <= max(abs_tol, rel_tol*|declared|).
+      min_points: minimum matched steps required to render a verdict.
+
+    Returns (ok, reason). ok=False => the declared run was not reproduced on canonical
+    data (off-protocol / fabricated log)."""
+    dd = {int(s): float(v) for s, v in declared if v == v}  # drop NaN
+    rr = {int(s): float(v) for s, v in rederived if v == v}
+    common = sorted(set(dd) & set(rr))
+    if len(common) < min_points:
+        return False, (
+            f"re-derivation produced too few comparable points ({len(common)} < {min_points}) "
+            f"— cannot confirm the declared training ran on canonical code/data"
+        )
+    # Step-0 fingerprint: init-seed weights forwarded on the first canonical batch.
+    # A miss here means different arch/seed/data than the canonical recipe.
+    if 0 in common and abs(dd[0] - rr[0]) > step0_tol:
+        return False, (
+            f"re-derivation mismatch at step 0: declared loss {dd[0]:.3f} vs re-derived "
+            f"{rr[0]:.3f} (tol {step0_tol:.2f}) — different init/data/arch than the canonical "
+            f"recipe: the checkpoint was trained off-protocol or the log is fabricated"
+        )
+    fails = []
+    for s in common:
+        tol = step0_tol if s == 0 else max(abs_tol, rel_tol * abs(dd[s]))
+        if abs(dd[s] - rr[s]) > tol:
+            fails.append((s, dd[s], rr[s], tol))
+    # Tolerate a single noisy point; a majority outside band = systematic divergence.
+    if len(fails) > max(0, (len(common) - 1) // 2):
+        s, d, r, t = fails[0]
+        return False, (
+            f"re-derivation trajectory mismatch: {len(fails)}/{len(common)} steps outside band "
+            f"(e.g. step {s}: declared {d:.3f} vs re-derived {r:.3f}, tol {t:.2f}) — the declared "
+            f"training was not reproduced on canonical data (off-protocol)"
+        )
+    return True, f"re-derivation reproduced {len(common) - len(fails)}/{len(common)} trajectory points"
+
+
 def _added_config_jsons(patch_text: str) -> list[dict]:
     """Parse every NEW/whole configs/*.json the patch adds (best-effort)."""
     import json
