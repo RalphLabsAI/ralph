@@ -1523,6 +1523,27 @@ def main():
                          f"{result['accepted']} accepted, {result['rejected']} rejected{mf_str}")
             else:
                 log_info(f"epoch {epoch}: no pending submissions")
+                # Idle: drain ONE pending audit job. This was dead — run_pending_audits
+                # was called nowhere, so 0 fraud/blacklist events ever fired and every
+                # economic-deterrence claim was moot. On a re-derivation mismatch it
+                # appends submission_fraud + blacklists the miner (zeroed next set_weights).
+                # Off: RALPH_AUDIT_LOOP_OFF=1. NOTE the audit is a proxy re-run until
+                # canonical data + checkpoint-bound re-derivation land (plan P2/P4).
+                if os.environ.get("RALPH_AUDIT_LOOP_OFF") != "1":
+                    try:
+                        from validator.audit_scheduler import run_pending_audits
+
+                        _a = run_pending_audits(
+                            chain, RALPH_ROOT, RALPH_ROOT / "chain",
+                            noise_floor_margin=args.noise_floor, limit=1,
+                        )
+                        if _a.get("processed"):
+                            log_info(
+                                f"audit: processed {_a['processed']} "
+                                f"(passed {_a.get('passed', 0)}, failed {_a.get('failed', 0)})"
+                            )
+                    except Exception as _e:  # noqa: BLE001 — audit must never crash the epoch loop
+                        log_warn(f"audit loop error: {_e}")
         except Exception as e:
             log_err(f"epoch {epoch} failed: {e}")
             log_debug(traceback.format_exc())
