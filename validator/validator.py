@@ -46,6 +46,7 @@ from proof.runner import _load_restricted_paths, scan_diff_for_exploit_patterns,
 from proof.sources import compute_container_measurement
 from validator.integrity import (
     check_canonical_data_source,
+    check_checkpoint_not_blocklisted,
     check_compute_plausibility,
     check_recipe_config_matches_proof,
     check_training_timing,
@@ -194,6 +195,24 @@ def _git_commit_epoch(repo_dir: str) -> float | None:
     return None
 
 
+def _fraud_checkpoints(ralph_root: Path) -> set:
+    """Load the fraud/off-protocol checkpoint blocklist (chain/fraud_checkpoints.json).
+    Entries may be bare SHA-256 strings or {"checkpoint_sha256": ...} dicts. A missing
+    or malformed file yields an empty set (fail-open)."""
+    p = ralph_root / "chain" / "fraud_checkpoints.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    out: set = set()
+    for e in data if isinstance(data, list) else []:
+        if isinstance(e, str):
+            out.add(e)
+        elif isinstance(e, dict) and isinstance(e.get("checkpoint_sha256"), str):
+            out.add(e["checkpoint_sha256"])
+    return out
+
+
 def _canonical_code_epoch() -> float | None:
     """Wall-clock epoch the attested canonical code was 'born' — the commit time of
     the PINNED canonical recipe (RECIPE_DIR HEAD), or RALPH_CANONICAL_CODE_EPOCH if
@@ -280,6 +299,15 @@ def op1_diff_and_integrity(
         actual = _file_sha256(path)
         if actual != expected:
             return False, f"{name} hash mismatch (expected {expected[:8]}, got {actual[:8]})"
+
+    # Fraud-checkpoint blocklist: reject re-submission of a checkpoint previously
+    # dethroned as off-protocol/fabricated (identical model, new bundle hash +
+    # adjusted metadata). manifest['checkpoint_sha256'] is authenticated by the loop above.
+    ok_bl, detail_bl = check_checkpoint_not_blocklisted(
+        manifest.get("checkpoint_sha256"), _fraud_checkpoints(ralph_root)
+    )
+    if not ok_bl:
+        return False, detail_bl
 
     # Recompute bundle_hash from disk and require it match BOTH the
     # submission's signed-over hash AND the manifest's declared bundle hash.

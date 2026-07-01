@@ -199,6 +199,24 @@ def check_training_timing(
     return True, f"timing plausible: wall {wall / 3600:.1f}h <= code age {code_age / 3600:.1f}h"
 
 
+def check_checkpoint_not_blocklisted(checkpoint_sha256: str | None, blocked: set) -> tuple[bool, str]:
+    """Reject a checkpoint whose SHA-256 was previously dethroned as fraud/off-protocol.
+
+    Stopgap against re-submitting the IDENTICAL off-protocol model under a fresh
+    bundle hash + adjusted final_state metadata. The timing gate weakens as the
+    canonical code ages (a 7h claim becomes "possible" 7h after the cutover), so an
+    unchanged fraud checkpoint can otherwise be re-crowned by simply waiting. The
+    caller passes manifest['checkpoint_sha256'], which is authenticated against the
+    on-disk checkpoint by the artifact-integrity loop. Returns (ok, reason)."""
+    if isinstance(checkpoint_sha256, str) and checkpoint_sha256 in blocked:
+        return False, (
+            f"blocklisted checkpoint {checkpoint_sha256[:16]}… — this exact model was "
+            f"previously dethroned as off-protocol/fabricated; re-derive on the canonical "
+            f"code to resubmit"
+        )
+    return True, "checkpoint not blocklisted"
+
+
 def _added_config_jsons(patch_text: str) -> list[dict]:
     """Parse every NEW/whole configs/*.json the patch adds (best-effort)."""
     import json
