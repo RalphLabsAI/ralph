@@ -26,6 +26,43 @@ from validator.version import VALIDATOR_VERSION
 
 DEFAULT_REPO = "RalphLabsAI/proof-bundles"
 
+# --- DoS intake caps (single-validator crash protection) ----------------------
+# A miner bundle is downloaded, decrypted, and tar.gz-extracted into the ONE
+# validator. An unbounded extract is a crash-DoS (a tiny .gz can decompress to
+# terabytes — a decompression bomb — or ship one giant member). Hard-cap the
+# encrypted size, the decrypted blob, and — streamed, so it never expands in RAM
+# — the total decompressed bytes, BEFORE proof.runner unpacks it. Env-tunable.
+_MAX_ENC_BYTES = int(os.environ.get("RALPH_MAX_ENC_BYTES", str(2 << 30)))          # 2 GiB
+_MAX_BLOB_BYTES = int(os.environ.get("RALPH_MAX_BLOB_BYTES", str(2 << 30)))        # 2 GiB
+_MAX_DECOMPRESSED_BYTES = int(os.environ.get("RALPH_MAX_DECOMPRESSED_BYTES", str(3 << 30)))  # 3 GiB
+
+
+def _assert_blob_safe(blob: bytes) -> None:
+    """Reject an oversized / decompression-bomb decrypted blob before unpack.
+    Streams the gunzip with a hard byte cap so a bomb never expands in memory.
+    Raises ValueError on violation (the caller treats it as a decrypt/unpack fail)."""
+    import gzip
+    import io
+
+    if len(blob) > _MAX_BLOB_BYTES:
+        raise ValueError(f"decrypted blob {len(blob)} B > {_MAX_BLOB_BYTES} B cap")
+    total = 0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(blob)) as g:
+            while True:
+                chunk = g.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_DECOMPRESSED_BYTES:
+                    raise ValueError(
+                        f"decompressed size exceeds {_MAX_DECOMPRESSED_BYTES} B cap "
+                        f"(decompression bomb)"
+                    )
+    except OSError as e:
+        raise ValueError(f"bad gzip stream: {e}") from e
+
+
 # miner.hub titles every submission PR "Submit proof bundle <hash[:12]>".
 _TITLE_HASH_RE = re.compile(r"Submit proof bundle ([0-9a-f]{6,})", re.IGNORECASE)
 
@@ -203,7 +240,11 @@ def download_one(
                 repo_id=repo_id, filename=enc_remote, repo_type="dataset",
                 local_dir=str(cache), token=token, revision=git_ref,
             )
-            blob = bundle_crypto.decrypt(Path(local).read_bytes())
+            enc_bytes = Path(local).read_bytes()
+            if len(enc_bytes) > _MAX_ENC_BYTES:
+                raise ValueError(f"encrypted bundle {len(enc_bytes)} B > {_MAX_ENC_BYTES} B cap")
+            blob = bundle_crypto.decrypt(enc_bytes)
+            _assert_blob_safe(blob)  # DoS: cap decrypted + decompressed size before unpack
             bundle_crypto.unpack_bundle(blob, out)
             success = 1
         except Exception as e:
