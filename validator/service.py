@@ -1485,6 +1485,19 @@ def main():
     else:
         log_info("HF Hub poll: disabled")
     log_info(f"submit bundles to: {args.queue_dir / 'pending' / '<bundle_id>/'}")
+    # Benchmark blind-forgeability self-test (anti-gaming P0): warn loudly if the
+    # deployed active_benchmark.json is content-forgeable (a blind score=±token_id
+    # sweep beats chance), so it can never silently gate the crown once the
+    # benchmark is re-enabled host-reduced.
+    try:
+        from eval.benchmark import benchmark_blind_forgeable
+
+        _bp = RALPH_ROOT / "eval" / "private" / "active_benchmark.json"
+        if _bp.exists():
+            _forge, _why = benchmark_blind_forgeable(json.loads(_bp.read_text()))
+            (log_warn if _forge else log_info)(f"benchmark self-test: {_why}")
+    except Exception as _e:  # noqa: BLE001 — self-test must never block startup
+        log_warn(f"benchmark self-test skipped: {_e}")
     log_info("")
 
     epoch = 0
