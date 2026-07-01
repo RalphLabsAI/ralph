@@ -203,6 +203,37 @@ def check_compute_budget(
     return True, f"compute budget ok: {norm_h100h:.2f} H100h <= cap {budget:.1f}"
 
 
+# --- Model-size cap (fair fixed-arch contest) ---------------------------------
+#
+# The compute-budget cap limits FLOPs/wall, not CAPACITY. A big under-trained model
+# (e.g. 1.2B at <1 token/param) fits under the H100-hour budget yet wins on raw
+# capacity / held-out MEMORIZATION rather than recipe quality — the recurring
+# "1.2B, 0.6 tok/param, val_bpb 1.33" fraud class. n_params is un-forgeable: op4
+# builds the model from the declared config and load_state_dict fails if the
+# checkpoint's real shape differs, so a big model cannot masquerade as small.
+# Pins the contest to the canonical ~254M arch class (tunable RALPH_MAX_N_PARAMS).
+DEFAULT_MAX_N_PARAMS = 400_000_000
+
+
+def check_model_size(final_state: dict, *, max_n_params: int = DEFAULT_MAX_N_PARAMS) -> tuple[bool, str]:
+    """Reject a model larger than max_n_params. Best-effort: skipped if n_params
+    is absent/non-numeric. Returns (ok, reason); ok=False -> reject."""
+    fs = final_state or {}
+    try:
+        n = float(fs.get("n_params", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "model-size: non-numeric n_params (skipped)"
+    if n <= 0:
+        return True, "model-size: no n_params (skipped)"
+    if n > max_n_params:
+        return False, (
+            f"model too large: n_params={n / 1e6:.0f}M > cap {max_n_params / 1e6:.0f}M — the 1x-H100 "
+            f"contest is a fixed ~254M-class recipe competition; a bigger under-trained model wins on "
+            f"capacity/held-out-memorization, not recipe quality"
+        )
+    return True, f"model size ok: {n / 1e6:.0f}M <= {max_n_params / 1e6:.0f}M"
+
+
 # --- Training-timing plausibility (anti off-protocol-training) -----------------
 #
 # op2 attestation proves the canonical recipe/runner CODE was present in the

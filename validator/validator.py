@@ -49,6 +49,7 @@ from validator.integrity import (
     check_checkpoint_not_blocklisted,
     check_compute_budget,
     check_compute_plausibility,
+    check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
 )
@@ -419,6 +420,16 @@ def op1_diff_and_integrity(
             )
             if not ok_b:
                 return False, detail_b
+        # Model-size cap (fair fixed-arch contest; blocks the big-under-trained
+        # memorizer that fits under the compute budget). Disable: RALPH_MODEL_SIZE_GATE_OFF=1.
+        if os.environ.get("RALPH_MODEL_SIZE_GATE_OFF") != "1":
+            try:
+                _maxn = int(float(os.environ.get("RALPH_MAX_N_PARAMS", "") or 400_000_000))
+            except (TypeError, ValueError):
+                _maxn = 400_000_000
+            ok_sz, detail_sz = check_model_size(final_state, max_n_params=_maxn)
+            if not ok_sz:
+                return False, detail_sz
         # Off-protocol training: a checkpoint attesting to the canonical code cannot
         # have trained longer than that code has existed. Pairs with the MFU gate
         # above (too-long wall_clock here, too-short there). Disable: RALPH_TIMING_GATE_OFF=1.

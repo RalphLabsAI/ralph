@@ -41,6 +41,22 @@ def test_budget_skips_without_wall():
     assert check_compute_budget({"wall_clock_s": 0}, {}, budget=5.0, mm_ref_hopper=0.344)[0]
 
 
+# --- model-size cap (fair fixed-arch contest) --------------------------------
+def test_model_size_rejects_big_undertrained():
+    # taohunter251 / gradient-artist: 1.2B model that fits under the compute budget.
+    ok, reason = check_model_size({"n_params": 1_216_087_552}, max_n_params=400_000_000)
+    assert not ok and "model too large" in reason
+
+
+def test_model_size_accepts_canonical_254m():
+    assert check_model_size({"n_params": 253_874_184}, max_n_params=400_000_000)[0]
+
+
+def test_model_size_skips_without_n_params():
+    assert check_model_size({}, max_n_params=400_000_000)[0]
+    assert check_model_size({"n_params": 0}, max_n_params=400_000_000)[0]
+
+
 # --- Hopper-only GPU arch bind (proof.gpu_arch) ------------------------------
 def _fake_jwt(payload: dict) -> str:
     import base64
