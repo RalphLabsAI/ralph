@@ -151,6 +151,58 @@ def check_compute_plausibility(
     return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
 
 
+# --- Compute-budget cap (fair "1x H100-class" contest) ------------------------
+#
+# Cap total normalized H100-hours so the crown is a FIXED compute-budget contest
+# (best recipe wins) rather than "whoever buys the most tokens wins". SPOOF-PROOF:
+# the denominator is a FIXED validator-side Hopper reference (mm_ref_hopper), NOT
+# the miner-reported calibration matmul_ms — a fabricated large matmul_ms cannot
+# shrink the cost under the cap. wall_clock_s is the only miner input, and it is
+# independently lower-bounded by check_compute_plausibility's MFU gate (too-short
+# wall => impossible throughput => rejected there). Pairs with the Hopper arch
+# bind (op2): the die is attested GH100, so one fixed Hopper ref is the right
+# normalizer. Tunable via RALPH_H100H_BUDGET / RALPH_H100H_MM_REF_HOPPER.
+DEFAULT_H100H_BUDGET = 5.0
+DEFAULT_MM_REF_HOPPER = 0.344  # fastest attested Hopper (H200) matmul_ms; conservative (never under-charges)
+
+
+def check_compute_budget(
+    final_state: dict,
+    calibration: dict | None = None,
+    *,
+    budget: float = DEFAULT_H100H_BUDGET,
+    h100_matmul_ms_ref: float | None = None,
+    mm_ref_hopper: float = DEFAULT_MM_REF_HOPPER,
+) -> tuple[bool, str]:
+    """Reject a bundle whose normalized H100-hours exceed `budget`.
+    norm_h100h = (wall_clock_s/3600) * (h100_ref / mm_ref_hopper), using FIXED
+    references so a spoofed calibration matmul_ms cannot duck the cap. Best-effort:
+    incomplete/non-finite wall_clock_s is skipped. Returns (ok, reason)."""
+    fs = final_state or {}
+    try:
+        wall = float(fs.get("wall_clock_s", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "compute-budget: non-numeric wall_clock_s (skipped)"
+    if wall <= 0 or not math.isfinite(wall):
+        return True, "compute-budget: incomplete/non-finite wall_clock_s (skipped)"
+    if h100_matmul_ms_ref is None:
+        try:
+            from validator.scoring import _h100_matmul_ms_ref
+            h100_matmul_ms_ref = _h100_matmul_ms_ref()
+        except Exception:  # noqa: BLE001 — fall back to the calibrated H100 ref
+            h100_matmul_ms_ref = 0.51
+    if mm_ref_hopper <= 0:
+        mm_ref_hopper = DEFAULT_MM_REF_HOPPER
+    norm_h100h = (wall / 3600.0) * (h100_matmul_ms_ref / mm_ref_hopper)
+    if norm_h100h > budget:
+        return False, (
+            f"over compute budget: normalized_H100_hours={norm_h100h:.2f} > cap {budget:.1f} "
+            f"(wall {wall / 3600:.2f}h at fixed Hopper ref {mm_ref_hopper:.3f}ms; miner matmul_ms "
+            f"ignored to prevent spoofing) — exceeds the fair 1x H100-class budget"
+        )
+    return True, f"compute budget ok: {norm_h100h:.2f} H100h <= cap {budget:.1f}"
+
+
 # --- Training-timing plausibility (anti off-protocol-training) -----------------
 #
 # op2 attestation proves the canonical recipe/runner CODE was present in the

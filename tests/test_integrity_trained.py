@@ -10,12 +10,77 @@ from validator.integrity import (
     check_canonical_data_source,
     check_checkpoint_not_blocklisted,
     check_checkpoint_trained,
+    check_compute_budget,
     check_compute_plausibility,
     check_recipe_config_matches_proof,
     check_training_timing,
     compare_loss_trajectory,
     nats_per_token_from_bpb,
 )
+
+
+# --- compute-budget cap (fair 1x H100-class contest) -------------------------
+def test_budget_rejects_over_cap():
+    # martyniukr (H200): wall 19321s -> ~7.96 norm-H100h at the fixed 0.344 ref.
+    ok, reason = check_compute_budget({"wall_clock_s": 19321.0}, {"matmul_ms": 0.344}, budget=5.0, mm_ref_hopper=0.344)
+    assert not ok and "over compute budget" in reason
+
+
+def test_budget_accepts_under_cap():
+    # revert king c48ad59d: wall 7117s -> ~2.93 norm-H100h.
+    assert check_compute_budget({"wall_clock_s": 7117.0}, {"matmul_ms": 0.344}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+def test_budget_spoofproof_matmul_ms():
+    # A fabricated large matmul_ms must NOT shrink the cost under the cap (fixed ref).
+    over = {"wall_clock_s": 19321.0}
+    assert not check_compute_budget(over, {"matmul_ms": 5.0}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+def test_budget_skips_without_wall():
+    assert check_compute_budget({"wall_clock_s": 0}, {}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+# --- Hopper-only GPU arch bind (proof.gpu_arch) ------------------------------
+def _fake_jwt(payload: dict) -> str:
+    import base64
+    import json as _j
+    seg = base64.urlsafe_b64encode(_j.dumps(payload).encode()).rstrip(b"=").decode()
+    return "aGRy." + seg + ".c2ln"  # header.<payload>.sig (sig unchecked here; op2 verifies the real sig)
+
+
+def _gpu_token(hwmodel: str, *, break_digest: bool = False) -> str:
+    import hashlib
+    import json as _j
+    filler = "x" * 80  # keep each JWT > 80 chars so _all_jwts picks it up
+    detached = _fake_jwt({"hwmodel": hwmodel, "eat_nonce": "n", "pad": filler})
+    digest = "deadbeef" * 8 if break_digest else hashlib.sha256(detached.encode()).hexdigest()
+    wrapper = _fake_jwt({"submods": {"GPU-0": ["DIGEST", ["SHA-256", digest]]}, "eat_nonce": "n", "pad": filler})
+    return _j.dumps([wrapper, detached])
+
+
+def test_arch_allows_gh100():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    ok, _r, die = verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GH100")}]}, allow={"GH100"})
+    assert ok and die == "GH100"
+
+
+def test_arch_denies_blackwell():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    ok, _r, die = verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GB20X")}]}, allow={"GH100"})
+    assert not ok and die == "GB20X"
+
+
+def test_arch_denies_digest_mismatch():
+    # A swapped-in hwmodel EAT whose sha256 != the signed wrapper commitment.
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    assert not verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GH100", break_digest=True)}]})[0]
+
+
+def test_arch_denies_missing_token():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    assert not verify_gpu_arch_allowed({"epochs": [{"gpu_token": None}]}, allow={"GH100"})[0]
+    assert not verify_gpu_arch_allowed({"epochs": []}, allow={"GH100"})[0]
 
 
 # --- training-timing gate (anti off-protocol) --------------------------------
