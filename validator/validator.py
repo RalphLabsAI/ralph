@@ -45,6 +45,7 @@ from proof.real_attest import (
 from proof.runner import _load_restricted_paths, scan_diff_for_exploit_patterns, scan_diff_for_restricted
 from proof.sources import compute_container_measurement
 from validator.integrity import (
+    _canonical_manifest_hash,
     check_canonical_data_source,
     check_checkpoint_not_blocklisted,
     check_compute_plausibility,
@@ -417,7 +418,13 @@ def op1_diff_and_integrity(
             )
             if not ok_t:
                 return False, detail_t
-        ok_d, detail_d = check_canonical_data_source(final_state)
+        # Canonical-data check keys off the manifest CONTENT hash (machine-
+        # independent) when the validator's own canonical manifest is
+        # materialized, else falls back to a path heuristic. See
+        # check_canonical_data_source.
+        ok_d, detail_d = check_canonical_data_source(
+            final_state, canonical_manifest_hash=_canonical_manifest_hash()
+        )
         if not ok_d:
             return False, detail_d
         if patch_path.exists():

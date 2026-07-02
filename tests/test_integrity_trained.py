@@ -166,6 +166,56 @@ def test_data_source_skips_when_no_config():
     assert check_canonical_data_source({"config": {}})[0]
 
 
+# --- manifest-hash primary check (machine-independent canonical-data proof) ---
+_CANON_H = "2739e4ace8b70d5e940c3a115977920486fb8a87a68520ddc15b29e3ea95d590"
+
+
+def test_hash_match_accepts_honest_absolute_path():
+    # The real-world honest case that the path-only check wrongly rejected: the
+    # runner pins an ABSOLUTE manifest_path on the miner's box, but the manifest
+    # CONTENT hash equals the validator's canonical hash -> canonical data.
+    fs = {
+        "manifest_hash": _CANON_H,
+        "config": {"manifest_path": "/tmp/ralph/recipe/data/data_manifest.json",
+                   "data_base_dir": "/tmp/ralph/recipe/data"},
+    }
+    ok, reason = check_canonical_data_source(fs, canonical_manifest_hash=_CANON_H)
+    assert ok and "matches" in reason
+
+
+def test_hash_mismatch_rejects_off_corpus_training():
+    fs = {
+        "manifest_hash": "0" * 64,
+        "config": {"manifest_path": "data/data_manifest.json", "data_base_dir": "data"},
+    }
+    ok, reason = check_canonical_data_source(fs, canonical_manifest_hash=_CANON_H)
+    assert not ok and "non-canonical data source" in reason
+
+
+def test_hash_check_defeats_path_laundering_831():
+    # #831's fraud: rewrite the recorded path to look canonical/relative while
+    # training on other data. The hash is unchanged by the rewrite, so it is
+    # still caught -> the laundering vector is neutralized.
+    fs = {
+        "manifest_hash": "abc123" + "0" * 58,  # trained on non-canonical data
+        "config": {"manifest_path": "data/data_manifest.json", "data_base_dir": "data"},
+    }
+    ok, reason = check_canonical_data_source(fs, canonical_manifest_hash=_CANON_H)
+    assert not ok and "non-canonical data source" in reason
+
+
+def test_hash_unavailable_falls_back_to_path_heuristic():
+    # No canonical hash on this validator -> old path behaviour: relative ok,
+    # foreign absolute rejected.
+    assert check_canonical_data_source(
+        {"config": {"manifest_path": "data/data_manifest.json"}}, canonical_manifest_hash=None
+    )[0]
+    assert not check_canonical_data_source(
+        {"config": {"manifest_path": "/home/evil/recipe/data/data_manifest.json"}},
+        canonical_manifest_hash=None,
+    )[0]
+
+
 def test_rejects_the_uid155_random_king():
     # Measured in the incident: ~11.0 nats/token, log claimed final_loss 3.05.
     ok, reason = check_checkpoint_trained(11.0, VOCAB, claimed_final_loss=3.0496)

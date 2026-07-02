@@ -343,32 +343,119 @@ def check_recipe_config_matches_proof(patch_text: str, final_state: dict) -> tup
     return True, "config matches proof"
 
 
-# Miner-host data paths a canonical run must never reference. The locked
-# canonical data_manifest is relative (e.g. "data/data_manifest.json"); a config
-# that points manifest_path/data_base_dir at /home, /mnt, … is a data-lock bypass
+# Miner-host data paths a canonical run must never reference. A config that
+# points manifest_path/data_base_dir at /home, /mnt, … is a data-lock bypass
 # (the run trained on the miner's own data, possibly contaminated with the
 # held-out, then claimed the canonical recipe). The in-the-wild case:
 # manifest_path="/home/root/diony/recipe/data/data_manifest.json".
-# ALLOWLIST, not blocklist: canonical data lives at a container-RELATIVE path
-# (e.g. "data/data_manifest.json"), resolved inside the proof container against the
-# canonical recipe tree. ANY absolute path ("/..."), home ("~"), or parent-escape
-# ("..") points outside that tree to a miner-controlled location = a data-lock
-# bypass, regardless of the specific prefix. The old per-prefix blocklist
-# (/home|/mnt|...) missed /dstack; this matches every absolute/escaping path by
+# ALLOWLIST, not blocklist: canonical data is either the container-RELATIVE
+# path (e.g. "data/data_manifest.json") OR the one absolute value
+# proof.runner itself pins (RECIPE_DIR/data, realpath-resolved — see
+# _canonical_absolute_data_paths; the runner forces this via CLI args
+# regardless of what the miner's config requests, so a legitimate
+# final_state.config always carries exactly that absolute string). ANY OTHER
+# absolute path ("/..."), home ("~"), or parent-escape ("..") points outside
+# that tree to a miner-controlled location = a data-lock bypass, regardless
+# of the specific prefix. The old per-prefix blocklist (/home|/mnt|...)
+# missed /dstack; this matches every other absolute/escaping path by
 # construction, so there is no prefix left to enumerate around.
 _NONCANONICAL_PATH_RE = re.compile(r"^\s*(?:~|\.\.|/)")
 
 
-def check_canonical_data_source(final_state: dict) -> tuple[bool, str]:
-    """Reject a bundle whose training config points the data manifest/dir outside
-    the canonical container-relative data tree. NOTE: this lives in
-    `final_state.config`, NOT the patch diff, so the restricted/exploit patch
-    scanners miss it — op1 must check it here. Best-effort: skipped when there is
-    no config. Returns (ok, reason)."""
+def _canonical_absolute_data_paths() -> dict[str, str]:
+    """The absolute values proof.runner itself pins for manifest_path/data_base_dir.
+
+    run_proof_test forces --manifest and --data-base-dir to RECIPE_DIR/data,
+    realpath-resolved, regardless of what the miner's patch/config requests —
+    so every legitimate final_state.config carries THESE exact absolute
+    strings, never a relative one. These are the only absolute values this
+    allowlist may accept; anything else absolute/escaping is a data-lock bypass.
+    """
+    import ralph_bootstrap
+
+    recipe_data = (ralph_bootstrap.RECIPE_DIR / "data").resolve()
+    manifest = str(recipe_data / "data_manifest.json")
+    data_base = str(recipe_data)
+    return {
+        "manifest_path": manifest,
+        "data_base_dir": data_base,
+        "data_dir": data_base,
+        "data_path": data_base,
+    }
+
+
+def _canonical_manifest_hash() -> str | None:
+    """SHA-256 `manifest_hash` of the validator's OWN canonical data manifest
+    (RECIPE_DIR/data/data_manifest.json).
+
+    This is a content hash of the locked corpus's manifest, so it is
+    machine-INDEPENDENT: every honest run of the canonical corpus records the
+    exact same hash in final_state, regardless of the absolute path the run
+    happened to load it from (a miner box's /tmp/.../data vs the validator's
+    own path). Returns None when the manifest isn't materialized on this
+    validator, in which case callers fall back to the path heuristic.
+    """
+    try:
+        import ralph_bootstrap
+        from data.manifest import DataManifest
+
+        mpath = ralph_bootstrap.RECIPE_DIR / "data" / "data_manifest.json"
+        if not mpath.exists():
+            return None
+        return DataManifest.from_path(mpath).manifest_hash()
+    except Exception:
+        return None
+
+
+def check_canonical_data_source(
+    final_state: dict, canonical_manifest_hash: str | None = None
+) -> tuple[bool, str]:
+    """Reject a bundle whose training used a non-canonical data source.
+
+    Lives against `final_state` (not the patch diff), so the restricted/exploit
+    patch scanners miss it — op1 must check it here. Best-effort: skipped when
+    there is no config. Returns (ok, reason).
+
+    PRIMARY check — the manifest CONTENT hash. proof.runner pins --manifest to
+    the canonical data tree and train.py records its `manifest_hash` in
+    final_state; that hash is identical for every honest run of the locked
+    corpus on ANY box, regardless of the absolute path string. Comparing hashes
+    (not path strings) is what lets an honest run whose recorded
+    manifest_path is an absolute miner-box path (e.g.
+    /tmp/ralph/recipe/data/data_manifest.json) pass, while genuinely off-corpus
+    training (different hash) is rejected — and unlike the path string, the hash
+    cannot be laundered by rewriting the recorded path to look relative (the
+    reverted #831 data-lock-bypass vector leaves the hash unchanged).
+
+    FALLBACK — when the validator hasn't materialized its canonical manifest
+    (hash unavailable) or the bundle predates `manifest_hash`, fall back to the
+    older path heuristic: accept the container-relative path and the exact
+    runner-pinned absolute path, reject any other absolute/escaping path.
+    """
     cfg = (final_state or {}).get("config") or {}
+    if not cfg:
+        return True, "canonical data source (no config)"
+
+    if canonical_manifest_hash is None:
+        canonical_manifest_hash = _canonical_manifest_hash()
+    recorded_hash = (final_state or {}).get("manifest_hash")
+    if canonical_manifest_hash and isinstance(recorded_hash, str) and recorded_hash:
+        if recorded_hash == canonical_manifest_hash:
+            return True, f"canonical data source (manifest_hash {recorded_hash[:8]} matches)"
+        return False, (
+            f"non-canonical data source: final_state.manifest_hash="
+            f"{recorded_hash[:8]} != canonical {canonical_manifest_hash[:8]} — "
+            f"training used a different data manifest than the locked corpus"
+        )
+
+    canonical = _canonical_absolute_data_paths()
     for key in ("manifest_path", "data_base_dir", "data_dir", "data_path"):
         v = cfg.get(key)
-        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(v):
+        if not (isinstance(v, str) and v.strip()):
+            continue
+        if v == canonical[key]:
+            continue
+        if _NONCANONICAL_PATH_RE.match(v):
             return False, (
                 f"non-canonical data source: config.{key}={v!r} is not a "
                 f"container-relative path — canonical data is the relative data/ "
