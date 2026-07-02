@@ -36,6 +36,48 @@ _MAX_ENC_BYTES = int(os.environ.get("RALPH_MAX_ENC_BYTES", str(2 << 30)))       
 _MAX_BLOB_BYTES = int(os.environ.get("RALPH_MAX_BLOB_BYTES", str(2 << 30)))        # 2 GiB
 _MAX_DECOMPRESSED_BYTES = int(os.environ.get("RALPH_MAX_DECOMPRESSED_BYTES", str(3 << 30)))  # 3 GiB
 
+# --- HF fetch timeout (hang / slowloris protection) ---------------------------
+# huggingface_hub has no total-download timeout: a fetch that stalls mid-stream
+# (the socket lingers with no data) blocks the ENTIRE epoch loop indefinitely — a
+# single dead/slow bundle froze the validator for ~35min, and a miner could upload
+# a deliberately-slow bundle to freeze scoring (DoS). A SIGALRM wall-clock cap
+# bounds each fetch: on expiry it's treated as transient (retried), and a bundle
+# that stalls _MAX_STALLS times in a row is marked done so it can't churn. The
+# default is generous so large legit bundles (checkpoints) still finish.
+_HF_FETCH_TIMEOUT_S = int(os.environ.get("RALPH_HF_FETCH_TIMEOUT_S", "300"))  # 5 min
+_MAX_STALLS = int(os.environ.get("RALPH_HF_MAX_STALLS", "3"))
+_STALL_COUNTS: dict[str, int] = {}  # bundle_id -> consecutive stalls (in-process)
+
+
+class _FetchTimeout(Exception):
+    """A single HF fetch (list/download) exceeded _HF_FETCH_TIMEOUT_S."""
+
+
+def _with_timeout(seconds: int, fn, *args, **kwargs):
+    """Run fn under a hard SIGALRM wall-clock cap and restore the prior handler.
+
+    Main-thread only (signals can't be armed off it); off the main thread it runs
+    uncapped — the service loop that calls poll_hub IS the main thread, so the cap
+    applies in production. A signal interrupts a blocked socket read (EINTR), which
+    is exactly the stalled-download case.
+    """
+    import signal
+    import threading
+
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        return fn(*args, **kwargs)
+
+    def _fire(signum, frame):
+        raise _FetchTimeout(f"HF fetch exceeded {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(seconds)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
 
 def _assert_blob_safe(blob: bytes) -> None:
     """Reject an oversized / decompression-bomb decrypted blob before unpack.
@@ -266,9 +308,15 @@ def download_one(
     }
 
     try:
-        all_files = list_repo_files(repo_id, repo_type="dataset", token=token, revision=git_ref)
+        all_files = _with_timeout(
+            _HF_FETCH_TIMEOUT_S, list_repo_files,
+            repo_id, repo_type="dataset", token=token, revision=git_ref,
+        )
         prefix = f"submissions/{bundle_id}/"
         bundle_files = [f for f in all_files if f.startswith(prefix)]
+    except _FetchTimeout as e:
+        print(f"[hf_poller] list TIMEOUT for {bundle_id} @ {git_ref}: {e}")
+        return "stalled"
     except Exception as e:
         print(f"[hf_poller] list files failed for {bundle_id} @ {git_ref}: {e}")
         return "unavailable"
@@ -279,12 +327,14 @@ def download_one(
 
     cache = out / "_hf_cache"
     decrypt_err: Optional[str] = None  # set iff an enc blob downloaded but wouldn't decrypt/unpack
+    stalled = False  # set iff a fetch timed out (transient — retry, never close the PR)
     enc_remote = f"{prefix}{bundle_crypto.ENC_FILENAME}"
     if enc_remote in bundle_files:
         # Encrypted submission: download the blob, decrypt with the validator
         # key, and unpack — reproduces the same dir a plaintext bundle would.
         try:
-            local = hf_hub_download(
+            local = _with_timeout(
+                _HF_FETCH_TIMEOUT_S, hf_hub_download,
                 repo_id=repo_id, filename=enc_remote, repo_type="dataset",
                 local_dir=str(cache), token=token, revision=git_ref,
             )
@@ -295,6 +345,10 @@ def download_one(
             _assert_blob_safe(blob)  # DoS: cap decrypted + decompressed size before unpack
             bundle_crypto.unpack_bundle(blob, out)
             success = 1
+        except _FetchTimeout as e:
+            print(f"[hf_poller] download TIMEOUT for {bundle_id}: {e}")
+            success = 0
+            stalled = True
         except Exception as e:
             print(f"[hf_poller] decrypt/unpack failed for {bundle_id}: {e}")
             success = 0
@@ -305,7 +359,8 @@ def download_one(
         for remote_path in bundle_files:
             filename = remote_path.split("/")[-1]
             try:
-                local = hf_hub_download(
+                local = _with_timeout(
+                    _HF_FETCH_TIMEOUT_S, hf_hub_download,
                     repo_id=repo_id,
                     filename=remote_path,
                     repo_type="dataset",
@@ -316,6 +371,10 @@ def download_one(
                 dest = (training_dir / filename) if filename in training_files else (out / filename)
                 shutil.copy2(local, dest)
                 success += 1
+            except _FetchTimeout as e:
+                print(f"[hf_poller] download TIMEOUT for {bundle_id} ({filename}): {e}")
+                stalled = True
+                break
             except Exception as e:
                 print(f"[hf_poller] download {filename} failed: {e}")
 
@@ -330,6 +389,8 @@ def download_one(
             # close the PR; the caller stamps it done so it stops churning every epoch.
             _close_pr_wrong_key(repo_id, pr_num, token, bundle_id, decrypt_err)
             return "decrypt_failed"
+        if stalled:
+            return "stalled"  # fetch timed out — transient; caller counts + eventually skips
         return "unavailable"  # transient (network / mid-upload) — safe to retry
 
     # Annotate which PR this came from so the validator can merge later.
@@ -389,11 +450,24 @@ def poll_hub(
         if result == "ok":
             downloaded.append(bid)
             processed[bid] = VALIDATOR_VERSION
+            _STALL_COUNTS.pop(bid, None)
         elif result == "decrypt_failed":
             # Permanent (wrong/rotated seal key). Stamp done so we don't re-poll +
             # re-close it every epoch — the PR was closed with re-seal instructions.
             processed[bid] = VALIDATOR_VERSION
+            _STALL_COUNTS.pop(bid, None)
             print(f"[hf_poller] {bid[:8]}: decrypt failed — marked done (PR closed; re-seal to current pubkey)")
+        elif result == "stalled":
+            # Fetch timed out (the cap already fired, so no hang). Retry a few times
+            # in case it's a transient network blip; if it keeps stalling, mark it
+            # done so one unfetchable bundle can't re-stall the loop every epoch.
+            _STALL_COUNTS[bid] = _STALL_COUNTS.get(bid, 0) + 1
+            if _STALL_COUNTS[bid] >= _MAX_STALLS:
+                processed[bid] = VALIDATOR_VERSION
+                _STALL_COUNTS.pop(bid, None)
+                print(f"[hf_poller] {bid[:8]}: download stalled {_MAX_STALLS}x — marked done (unfetchable, skipping)")
+            else:
+                print(f"[hf_poller] {bid[:8]}: download stalled ({_STALL_COUNTS[bid]}/{_MAX_STALLS}) — will retry")
         else:  # "unavailable" — transient; leave un-stamped so it retries next epoch
             print(f"[hf_poller] skipped {bid} (unavailable — will retry)")
 

@@ -87,3 +87,40 @@ def test_close_pr_noop_without_pr_num(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _boom)
     hp._close_pr_wrong_key("RalphLabsAI/proof-bundles", None, None, "c" * 64, "x")  # no raise
+
+
+# --- HF fetch timeout (hang / slowloris protection) ---------------------------
+
+def test_with_timeout_fires_on_slow_call():
+    import time
+    # a call that runs longer than the cap raises _FetchTimeout (not a hang)
+    try:
+        hp._with_timeout(1, time.sleep, 5)
+        raise AssertionError("expected _FetchTimeout")
+    except hp._FetchTimeout:
+        pass
+
+
+def test_with_timeout_passes_through_fast_call():
+    assert hp._with_timeout(5, lambda: 42) == 42
+    import signal
+    # handler + alarm are restored (no lingering alarm)
+    assert signal.getitimer(signal.ITIMER_REAL)[0] == 0.0
+
+
+def test_poll_hub_stalled_retries_then_marks_done(tmp_path, monkeypatch):
+    monkeypatch.setattr(hp, "_MAX_STALLS", 2)
+    hp._STALL_COUNTS.clear()
+    prs = [_pr("st", 1)]
+    monkeypatch.setattr(hp, "list_remote_submissions", lambda repo_id, token=None: prs)
+    monkeypatch.setattr(hp, "download_one", lambda bid, repo_id, dest, **kw: "stalled")
+    bid = prs[0]["bundle_id"]
+
+    # 1st stall: retried (not done)
+    hp.poll_hub(tmp_path)
+    assert bid not in hp._load_state(tmp_path)["processed"]
+    assert hp._STALL_COUNTS[bid] == 1
+    # 2nd stall reaches _MAX_STALLS: marked done so it can't re-stall forever
+    hp.poll_hub(tmp_path)
+    assert hp._load_state(tmp_path)["processed"].get(bid) == VALIDATOR_VERSION
+    assert bid not in hp._STALL_COUNTS
