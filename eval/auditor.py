@@ -54,8 +54,12 @@ published — that is what `--history` (gap detection against the on-chain ancho
 it runs on every pass. And an auditor running L0 alone cannot detect a rigged SCORE, only a rigged
 SUM; that is not a flaw to hide, it is why the verdict names its levels.
 
-TWO IDENTITIES, AND THEY ARE NOT THE SAME STRING. `--signer` is the key the operator SIGNS
-RECORDS with; `--validator-hotkey` is the ss58 whose on-chain commitment slot holds the anchor.
+THREE KEYS, AND ONLY ONE OF THEM IS YOURS. `--signer` is the key the scoring validator SIGNS
+RECORDS with; `--anchor-hotkey` is the SCORING VALIDATOR's hotkey, whose on-chain commitment slot
+holds the trail's anchor — the same value for every auditor, read from chain, never signed with.
+Your own hotkey is `--wallet`/`--hotkey`, and it is what signs your weights and your verdict head.
+(`--validator-hotkey` is the old spelling of `--anchor-hotkey`; the first operator who saw it read
+it as "my validator's hotkey", which is exactly the wrong key.)
 The first version passed the record signer to the metagraph lookup, so every round read INCOMPLETE
 and a daemon with `--set-weights` verified everything correctly and then wrote nothing, forever.
 That is why preflight refuses to start rather than letting a misconfiguration look like a quiet
@@ -65,7 +69,8 @@ subnet.
     python -m eval.auditor --follow --require L0,L1 --signer <k> --interval 600
     python -m eval.auditor --follow --require L0,L1,L2 --signer <k> \
         --observer HuggingFaceTB/SmolLM2-1.7B-Instruct,google/gemma-2-2b-it
-    python -m eval.auditor --follow --signer <k> --validator-hotkey <ss58> --set-weights
+    python -m eval.auditor --follow --signer <k> --anchor-hotkey <scoring validator ss58> \
+        --wallet <mine> --hotkey <mine> --set-weights
 """
 from __future__ import annotations
 
@@ -87,8 +92,8 @@ class AuditorConfig:
     # TWO DIFFERENT IDENTITIES, and conflating them was a blocker.
     #   expected_signer  -- the key the operator SIGNS RECORDS with (ed25519 hex, or an ss58 if the
     #                       operator signs with its hotkey). Pins whose trail this is.
-    #   validator_hotkey -- the ss58 whose on-chain COMMITMENT SLOT holds the anchor. Resolved
-    #                       against the metagraph.
+    #   validator_hotkey -- the SCORING validator's ss58, whose on-chain COMMITMENT SLOT holds
+    #                       the anchor. Resolved against the metagraph. CLI: --anchor-hotkey.
     # The first version passed expected_signer to the metagraph lookup, so an ed25519 hex string was
     # searched for among ss58 addresses, never found, and every round read INCOMPLETE forever.
     expected_signer: str = ""
@@ -825,16 +830,17 @@ def preflight(cfg: AuditorConfig, out=sys.stdout) -> list:
         # signer. Refusing here is the difference between "this cannot work" and "this silently
         # does nothing".
         if not cfg.validator_hotkey:
-            bad.append("--set-weights needs --validator-hotkey <ss58 of the validator whose "
-                       "commitment holds the anchor>: without the on-chain head the trail can "
-                       "only be compared against the operator's own index, so no round can ACCEPT")
+            bad.append("--set-weights needs --anchor-hotkey <ss58 of the SCORING validator, whose "
+                       "commitment holds the anchor — not your own hotkey>: without the on-chain "
+                       "head the trail can only be compared against the operator's own index, so "
+                       "no round can ACCEPT")
         if not cfg.expected_signer:
             bad.append("--set-weights needs --signer <the validator's record-signing public id>: "
                        "an unpinned signer means following whoever holds the repo")
         try:
             import bittensor  # noqa: F401
         except Exception as e:
-            bad.append(f"--set-weights needs bittensor>=10.5,<11: {e}")
+            bad.append(f"--set-weights needs bittensor>=11.1,<12 (requirements-chain.txt): {e}")
     try:
         import huggingface_hub  # noqa: F401
     except Exception:
@@ -885,7 +891,10 @@ def main(argv: list) -> int:
     cfg.verdicts_repo = opt("--verdicts-repo") or cfg.verdicts_repo
     cfg.commit_verdict_head = "--commit-verdicts" in argv
     cfg.expected_signer = opt("--signer") or cfg.expected_signer
-    cfg.validator_hotkey = opt("--validator-hotkey") or cfg.validator_hotkey
+    # `--anchor-hotkey` is the name; `--validator-hotkey` stays accepted for anyone who copied the
+    # old README. Either way it is the SCORING validator's key, read from chain — see the docstring.
+    cfg.validator_hotkey = (opt("--anchor-hotkey") or opt("--validator-hotkey")
+                            or cfg.validator_hotkey)
     cfg.wallet = opt("--wallet") or cfg.wallet
     cfg.hotkey = opt("--hotkey") or cfg.hotkey
     cfg.work_dir = opt("--work-dir") or cfg.work_dir
@@ -911,7 +920,7 @@ def main(argv: list) -> int:
         print("  WARN   no --signer pinned: verdicts will say the record is internally "
               "consistent, not that the subnet's validator wrote it")
     if not cfg.validator_hotkey:
-        print("  WARN   no --validator-hotkey: the on-chain anchor cannot be read, so every "
+        print("  WARN   no --anchor-hotkey: the on-chain anchor cannot be read, so every "
               "verdict reads INCOMPLETE (the trail is only checkable against the operator's index)")
     if cfg.verdicts_repo:
         print(f"  verdicts -> {cfg.verdicts_repo}"
