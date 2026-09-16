@@ -358,8 +358,8 @@ python -m eval.auditor --once  --require L0     --signer <validator record key> 
 python -m eval.auditor --follow --require L0,L1 --signer <key> --interval 600     # + the exam
 python -m eval.auditor --follow --require L0,L1,L2 --signer <key> \
     --observer <one-recorded-hf-id>                                                # one judge
-python -m eval.auditor --follow --signer <key> --validator-hotkey <ss58> \
-    --wallet <wallet> --hotkey <hotkey> --interval 1200 --set-weights             # act on it
+python -m eval.auditor --follow --signer <key> --anchor-hotkey <scoring validator ss58> \
+    --wallet <yours> --hotkey <yours> --interval 1200 --set-weights               # act on it
 ```
 
 The last form is what a weight-setting validator runs: every pass it re-verifies any new round,
@@ -382,7 +382,10 @@ different GPU the effects comparison is reported as *not run*, never as a diverg
 not evidence.
 
 **Two identities, and they are not the same string.** `--signer` is the key the operator signs
-records with; `--validator-hotkey` is the ss58 whose on-chain commitment holds the anchor. Weight
+records with; `--anchor-hotkey` is the ss58 whose on-chain commitment holds the anchor — the
+scoring validator's hotkey, the same value for every auditor, read from chain and never signed
+with (`--validator-hotkey` is the older spelling). Your own hotkey is `--wallet`/`--hotkey`; it
+signs your weights, and nothing else is needed on the box — no coldkey. Weight
 setting needs both, and preflight refuses to start without them rather than letting a
 misconfigured daemon look identical to a quiet subnet.
 

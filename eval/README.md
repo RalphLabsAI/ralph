@@ -113,7 +113,8 @@ Exit code `0` means the requested checks reproduced, `1` means a demonstrated di
 means incomplete. Running only L0/L1 does not verify the model inference that produced the scores.
 
 `eval.auditor` follows the trail and publishes signed verdicts at configured levels. Its
-`--signer` is the record-signing identity; `--validator-hotkey` is the separate ss58 identity whose
+`--signer` is the record-signing identity; `--anchor-hotkey` (formerly `--validator-hotkey`) is
+the scoring validator's ss58 — the same for every auditor, not the auditor's own key — whose
 on-chain commitment slot carries the anchor. L2 configuration should name recorded judges, and
 full multi-judge coverage requires separate passes for all three.
 
