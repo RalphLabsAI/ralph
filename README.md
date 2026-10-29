@@ -372,6 +372,19 @@ deterministic in the nonce — see `eval/rerun.py`).
 L1 needs no corpus file: the record pins the pool's digest inside its signed body, so the auditor
 fetches the pool from the trail and re-digests it.
 
+**Where `<key>` comes from.** It is the ed25519 public key the scoring validator signs every record
+with — public, the same on every round, and printed in the trail itself as `signer`, both in
+`index.json` and inside each record. Nobody hands it to you; read it from the trail and pin it:
+
+```bash
+curl -s https://huggingface.co/datasets/RalphLabsAI/ralph-v2-rounds/resolve/main/index.json \
+  | python3 -c 'import json,sys; print({r["signer"] for r in json.load(sys.stdin)["rounds"]})'
+```
+
+Today that prints `{'0f51a99a37905e1221e7c645097e3832c567e9f7b4dfd7f22ab3c66cf4a90493'}`. Pinning it
+is what makes a verdict about *this* validator's records rather than about whoever happens to hold
+the repo — and if the set ever has two entries, the trail changed signer, which is itself a finding.
+
 In a multi-judge record, one L2 pass re-derives one recorded judge's points. Run the check once per
 judge for full coverage; the audit reports partial coverage rather than implying that one model
 reproduced the aggregate.
