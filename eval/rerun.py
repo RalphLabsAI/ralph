@@ -129,23 +129,69 @@ def _obs_key(name: str) -> str:
 
 # ---------------------------------------------------------------- L0: arithmetic
 
+def _audit_signature(rec, a: Audit) -> None:
+    # The signature is what makes the record ATTRIBUTABLE. An unsigned record is a text file:
+    # self-consistent, and mintable by anyone with an editor.
+    if not (rec.signature and rec.signer):
+        a.add("L0", "signature present", FAIL, "record is unsigned — attributable to nobody")
+        return
+    try:
+        a.ok("L0", "signature valid", rec.verify_signature(),
+             fail="signature does not verify over the canonical payload",
+             info=f"{rec.sig_scheme} by {rec.signer[:16]}… (attributes the record; a "
+                  f"valid signature does NOT make its contents true)")
+    except Exception as e:
+        a.add("L0", "signature valid", FAIL, f"verify raised {type(e).__name__}: {e}")
+
+
+def audit_burn(rec, a: Audit) -> None:
+    """A burn record pays one uid and measures nothing, so its audit is exactly that small.
+
+    What it must still establish: who signed it (attribution), that the whole vector goes to the
+    declared target and nowhere else (an operator cannot smuggle a payee into a "burn"), and that
+    it carries no scores or crown events (a record that both measures and burns is neither — the
+    kings stay whatever the lineage says, and go unpaid). The expensive levels have nothing to
+    re-derive: no exam, no judge, no model. They are recorded as optional skips, so a validator
+    requiring L1 still ACCEPTs the burn rather than holding the previous vector forever."""
+    from .burn_round import emission_of
+    _audit_signature(rec, a)
+    em = emission_of(rec)
+    to = em.get("to")
+    a.ok("L0", "burn target declared", isinstance(to, str) and len(to) >= 40
+         and bool(str(em.get("reason") or "").strip()),
+         fail="burn record names no target hotkey, or gives no reason",
+         info=f"100% -> {str(to)[:12]}… (uid {em.get('to_uid')}): {em.get('reason')}")
+    a.ok("L0", "burn record scores nothing",
+         not rec.points and not rec.submissions and not rec.events and not rec.noise,
+         fail="a burn record carries points, submissions, events or a noise floor — a burn moves "
+              "no crown and measures nothing; a record that does both is neither")
+    a.ok("L0", "weights are the declared burn, exactly", dict(rec.weights or {}) == {to: 1.0},
+         fail=f"weights {rec.weights} but the record declares a burn to {str(to)[:12]}… — the "
+              f"whole vector goes there or it is not a burn")
+    # THE EXPENSIVE LEVELS VERIFY AN ABSENCE, and an absence is checkable. Recording them as
+    # skips read as "this level did not run", and a validator requiring L1 would then hold its
+    # previous vector forever — a burn nobody follows is no burn. What L1-L3 establish for a burn
+    # record is that there is no exam, no judge work and no model output hiding in it.
+    man = rec.manifest or {}
+    a.ok("L1", "burn record draws no exam", not man.get("item_indices") and not rec.points,
+         fail="a burn record carries an exam selection — nothing should have been drawn",
+         info="no items selected, nothing to re-derive")
+    a.ok("L2", "burn record has no judge effects to recompute",
+         not any(getattr(s, "effects", None) for s in rec.submissions),
+         fail="a burn record carries judge effects — it measured something",
+         info="no effects recorded")
+    a.ok("L3", "burn record has no model steps to regenerate",
+         not any(getattr(s, "steps", None) for s in rec.submissions),
+         fail="a burn record carries model steps — it ran a model",
+         info="no steps recorded")
+
+
 def audit_arithmetic(rec, a: Audit) -> None:
     """Everything recomputable from the record alone. No models, no corpus, no network."""
     from .koth import MIN_CROWN_LB, Scored, Submission, softmin_lcb_diff
     from .observer_kl import StepEffect, sample_score
 
-    # The signature is what makes the record ATTRIBUTABLE. An unsigned record is a text file:
-    # self-consistent, and mintable by anyone with an editor.
-    if not (rec.signature and rec.signer):
-        a.add("L0", "signature present", FAIL, "record is unsigned — attributable to nobody")
-    else:
-        try:
-            a.ok("L0", "signature valid", rec.verify_signature(),
-                 fail="signature does not verify over the canonical payload",
-                 info=f"{rec.sig_scheme} by {rec.signer[:16]}… (attributes the record; a "
-                      f"valid signature does NOT make its contents true)")
-        except Exception as e:
-            a.add("L0", "signature valid", FAIL, f"verify raised {type(e).__name__}: {e}")
+    _audit_signature(rec, a)
 
     a.ok("L0", "manifest present", bool(rec.manifest),
          fail="no re-run manifest — corpus/observer/versions unpinned")
@@ -863,6 +909,10 @@ def audit_loaded(rec, pool=None, observer=None, observer_name: str = "",
     rounds instead of re-reading and re-parsing a corpus file per round — and so a record fetched
     from a sink never has to be written to disk just to be checked."""
     a = Audit()
+    from .burn_round import is_burn
+    if is_burn(rec):
+        audit_burn(rec, a)
+        return a
     audit_arithmetic(rec, a)
 
     items = []

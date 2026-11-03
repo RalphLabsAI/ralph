@@ -435,6 +435,23 @@ incumbent operator — its previous weights persist on chain — but a fresh aud
 and a validator that writes no weights contributes nothing to consensus and eventually crosses
 `activity_cutoff` into inactive while believing it is validating.
 
+### Burn mode
+
+When the subnet is paused — between mechanisms, or while a crown rule is being rebuilt — the
+scoring validator publishes a **burn record** instead of a round: signed and anchored like any
+record, it scores nothing, names no king, and carries a weight vector that sends 100% to one
+declared uid (the subnet owner's, by Bittensor convention) with a stated reason:
+
+```bash
+python -m eval.burn_round --reason "paused while the next mechanism is built" --dry-run
+```
+
+Nothing changes for an auditor. The record reproduces at L0 (signature, the declared target, the
+whole vector going there, no scores or crown events smuggled in), the expensive levels have
+nothing to re-derive and are optional skips, and `--set-weights` pays the vector it carries. The
+kings keep their titles — the lineage replays events and a burn record has none — and go unpaid
+until the next scored record, which ends the burn for every follower at once.
+
 ### Publishing your verdicts
 
 ```bash
