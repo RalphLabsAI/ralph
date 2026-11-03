@@ -327,6 +327,8 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     unchanged = [r for r in rejected_all if _is_unchanged_row(r[1])]
     rejected = [r for r in rejected_all if not _is_unchanged_row(r[1])]
     kings = kings_from_events(rec.get("events") or [])
+    from .burn_round import emission_of, is_burn
+    emission = emission_of(rec) if is_burn(rec) else None   # a burn round moves no crown; say so
 
     # THE ROWS, PROJECTED HARD. The record's submissions carry `steps`, `effects`, `slices` and
     # `per_point` — megabytes of per-sample measurement that exist so an auditor can recompute the
@@ -397,6 +399,7 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
         # as "instant" — see the whole reason this module reports absence instead of defaults.
         "duration_s": round(published - started, 1) if (started and published) else None,
         "weights": rec.get("weights") or {},
+        **({"emission": emission} if emission else {}),
         "unclaimed": float(rec.get("unclaimed") or 0.0),
     }
 
