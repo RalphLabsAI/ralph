@@ -788,7 +788,11 @@ def test_the_torch_wheel_never_outruns_the_driver():
 
     assert _torch_index("12.8").endswith("cu128")
     assert _torch_index("13.0").endswith("cu130")
-    assert _torch_index("12.2").endswith("cu121"), "picked a wheel newer than the driver"
+    assert _torch_index("12.9").endswith("cu128"), "picked a wheel from the next major"
+    # cu121 tops out at torch 2.5.1, which transformers will not load. An older 12.x driver takes
+    # the oldest wheel line that still carries a usable torch, never one from another major.
+    assert _torch_index("12.2").endswith("cu124")
+    assert _torch_index("11.8").endswith("cu118")
     # An unknown driver must NOT be guessed at — score_job refuses in seconds instead.
     assert _torch_index("") == "" and _torch_index("nonsense") == ""
 

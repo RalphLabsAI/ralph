@@ -1084,10 +1084,16 @@ def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir
             w(f"  WARNING could not destroy {inst.id}: {e} — CHECK THE PROVIDER CONSOLE\n")
 
 
-# The torch wheel indexes, newest first. A driver reporting CUDA X.Y can run any build up to X.Y
-# and none above it, so the rule is "the newest wheel not newer than the driver".
-_TORCH_WHEELS = ((13.0, "cu130"), (12.8, "cu128"), (12.6, "cu126"), (12.4, "cu124"),
-                 (12.1, "cu121"), (11.8, "cu118"))
+# The torch wheel indexes, newest first. The rule is "the newest wheel not newer than the driver",
+# and it is strict ACROSS a major version: a cu130 wheel on a 12.8 driver cannot see the GPU.
+#
+# WITHIN 12.x THE FLOOR IS cu124, NOT THE DRIVER'S OWN MINOR. cu121 stops at torch 2.5.1 and
+# transformers refuses anything below 2.6, so a 12.2 driver matched to cu121 installs for fifteen
+# minutes and then dies loading the parent. NVIDIA's minor-version compatibility lets a 12.x
+# runtime run on any 12.x driver (>= 525), and the wheel ships its own runtime; if that ever fails
+# to hold, torch sees no GPU and `score_job._assert_gpu` refuses the round in seconds.
+_TORCH_WHEELS = ((13.0, "cu130"), (12.8, "cu128"), (12.6, "cu126"), (12.0, "cu124"),
+                 (11.8, "cu118"))
 
 
 def _torch_index(driver_cuda: str) -> str:
