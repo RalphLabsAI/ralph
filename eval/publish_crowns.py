@@ -225,7 +225,9 @@ def repo_license(manifest: dict) -> tuple[str, str]:
     ids = {licensed(e) for e in rows}
     if rows and len(ids) == 1 and next(iter(ids)):
         return next(iter(ids)).lower(), ""
-    return "other", "Artifact license pending"
+    # A SLUG, NOT A PHRASE. The Hub validates `license_name` against /^[a-z0-9-.]+$/ and rejects
+    # the whole commit otherwise — which is how a dethrone failed to mirror its new crown.
+    return "other", "artifact-license-pending"
 
 
 # ---------------------------------------------------------------- artifact metadata

@@ -37,7 +37,7 @@ def render(*, model_id: str, parent: str, parent_params: int, tier: str,
 
     head = f"""---
 license: other
-license_name: Artifact license pending
+license_name: artifact-license-pending
 library_name: gguf
 pipeline_tag: text-generation
 base_model: {parent}
