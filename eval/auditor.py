@@ -544,13 +544,10 @@ class Auditor:
         v.weights = dict(getattr(rec, "weights", {}) or {})
         from .burn_round import emission_of, is_allocation, is_burn
         if v.verdict == ACCEPT and (is_allocation(rec) or is_burn(rec)):
-            # NOT A CROWN, AND THE OPERATOR READING THIS LOG SHOULD NOT HAVE TO OPEN THE RECORD TO
-            # FIND OUT. An allocation pays a hotkey the subnet owner holds; a burn recycles.
+            # Not a crown; one line says so. Who holds an allocation's target is in the record.
             em = emission_of(rec)
-            v.note = ((f"OWNER ALLOCATION: 100% -> uid {em.get('to_uid')} {str(em.get('to'))[:12]}… "
-                       f"(held by the {em.get('held_by')}) — not a competition result, not a burn")
-                      if is_allocation(rec) else
-                      f"BURN: 100% -> uid {em.get('to_uid')} — no competition this round")
+            v.note = (f"Reward Allocation: 100% -> uid {em.get('to_uid')}" if is_allocation(rec)
+                      else f"Burn: 100% -> uid {em.get('to_uid')}")
         return self._finish(v)
 
     def _finish(self, v: Verdict) -> Verdict:

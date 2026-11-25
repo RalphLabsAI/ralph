@@ -145,13 +145,13 @@ def _audit_signature(rec, a: Audit) -> None:
 
 
 def audit_burn(rec, a: Audit) -> None:
-    """A burn or an owner allocation pays one uid and measures nothing, so its audit is that small.
+    """A burn or a reward allocation pays one uid and measures nothing, so its audit is that small.
 
     What it must still establish: who signed it (attribution), that the whole vector goes to the
     declared target and nowhere else (no payee smuggled in beside it), and that it carries no scores
-    or crown events (a record that both measures and declares emission is neither). An owner
-    allocation must also say WHOSE the target is — the payee's coldkey and the statement that the
-    subnet owner holds it — because that is what separates it from a burn and from a crown.
+    or crown events (a record that both measures and declares emission is neither). A reward
+    allocation must also say WHOSE the target is — the payee's coldkey and `held_by: subnet owner` —
+    because that is what separates it from a burn and from a crown.
     L1-L3 verify absence rather than skip, so a validator requiring them follows the record."""
     from .burn_round import HELD_BY_OWNER, emission_of, is_allocation
     _audit_signature(rec, a)
@@ -162,7 +162,7 @@ def audit_burn(rec, a: Audit) -> None:
                 and bool(str(em.get("reason") or "").strip()))
     if label == "allocation":
         declared = declared and len(str(em.get("to_coldkey") or "")) >= 40 \
-            and em.get("held_by") == HELD_BY_OWNER and bool(str(em.get("statement") or "").strip())
+            and em.get("held_by") == HELD_BY_OWNER
     a.ok("L0", f"{label} target declared", declared,
          fail=(f"{label} record does not name its target, its reason"
                + (", the payee's coldkey, or that the subnet owner holds it"

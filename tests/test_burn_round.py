@@ -131,7 +131,7 @@ def test_a_burn_that_measures_or_pays_anyone_else_is_refused():
         assert not any(is_burn(r) for r in _records(root)[:-1])
 
 
-# ---------------------------------------------------------------- owner allocation
+# ---------------------------------------------------------------- reward allocation
 
 ALLOC = "5G8iypbYKr8GL1CfWaoZe6Sk5tHXi8kh4WaacBpGeqN6NoFi"
 ALLOC_CK = "5GC9V7pLdpnurDCTLXiYwcTQVYrjQaFUUAfLNc3QfmqNa5NU"
@@ -143,8 +143,8 @@ def _allocate_on(dd, root, chain, sig, reason="treasury for the next mechanism")
     pub = RecordPublisher(LocalSink(root), window=8, state_path=str(Path(dd) / "hwm-alloc.json"))
     n = len(pub.load_index()["rounds"]) + 1
     rec = build_allocation_record(round_no=n, prev_anchor=pub.head_anchor(), to_hotkey=ALLOC,
-                                  to_uid=13, to_coldkey=ALLOC_CK, owner_coldkey=OWNER_CK,
-                                  reason=reason, parent_key="qwen3-8b", round_nonce="0xalloc",
+                                  to_uid=13, to_coldkey=ALLOC_CK, reason=reason,
+                                  parent_key="qwen3-8b", round_nonce="0xalloc",
                                   declared_at=1_800_000_000.0)
     rec.sign(sig)
     rep = publish_and_gate(pub, rec, anchor_fn=chain.publish_record,
@@ -152,7 +152,7 @@ def _allocate_on(dd, root, chain, sig, reason="treasury for the next mechanism")
     return rec, rep, pub
 
 
-def test_an_owner_allocation_is_declared_as_one_and_reproduces():
+def test_a_reward_allocation_records_whose_it_is_and_reproduces():
     from eval.burn_round import is_allocation, is_emission_record
     with tempfile.TemporaryDirectory() as dd:
         root, chain, sig, idx = _auditor_fixture(dd)
@@ -160,9 +160,8 @@ def test_an_owner_allocation_is_declared_as_one_and_reproduces():
         assert rep.ok and rep.anchor_verified, rep.reasons
         em = emission_of(rec)
         assert is_allocation(rec) and is_emission_record(rec) and not is_burn(rec)
+        assert em["mode"] == "reward_allocation"
         assert em["held_by"] == "subnet owner" and em["to_coldkey"] == ALLOC_CK
-        assert em["owner_coldkey"] == OWNER_CK
-        assert "not a competition result and not a burn" in em["statement"]
         assert rec.weights == {ALLOC: 1.0} and not rec.events and not rec.submissions
 
         a = audit(str(Path(root) / pub.load_index()["rounds"][-1]["name"]))
@@ -193,8 +192,8 @@ def test_a_follower_pays_the_allocation_and_says_what_it_is():
         v = a.once()[-1]
         assert v.verdict == ACCEPT, (v.verdict, v.failed, v.note)
         assert wrote[-1] == {ALLOC: 1.0}
-        assert "OWNER ALLOCATION" in v.note and "uid 13" in v.note and "not a burn" in v.note
-        assert "OWNER ALLOCATION" in out.getvalue(), "the operator's log must say what it is paying"
+        assert v.note == "Reward Allocation: 100% -> uid 13", v.note
+        assert "Reward Allocation: 100% -> uid 13" in out.getvalue()
 
 
 def test_an_allocation_that_hides_whose_it_is_is_refused():
@@ -214,7 +213,7 @@ def test_an_allocation_that_hides_whose_it_is_is_refused():
             p.write_text(json.dumps(asdict(r2)))
             return audit(str(p))
 
-        # the disclosure stripped out: no "held by the subnet owner"
+        # held_by stripped out
         a = rigged(lambda r: r["manifest"]["emission"].pop("held_by"))
         assert any(c.name == "allocation target declared" for c in a.failed)
         # the payee's coldkey stripped out
@@ -229,8 +228,8 @@ def test_an_allocation_that_hides_whose_it_is_is_refused():
         assert not a.failed
         with pytest.raises(ValueError):
             build_allocation_record(round_no=9, prev_anchor="", to_hotkey=ALLOC, to_uid=13,
-                                    to_coldkey="", owner_coldkey=OWNER_CK, reason="x",
-                                    parent_key="qwen3-8b", round_nonce="0x0")
+                                    to_coldkey="", reason="x", parent_key="qwen3-8b",
+                                    round_nonce="0x0")
 
 
 def test_a_burn_that_pays_someone_else_is_refused_by_the_follower():
@@ -278,3 +277,30 @@ def test_a_burn_that_pays_someone_else_is_refused_by_the_follower():
                         set_weights_fn=lambda w: (wrote2.append(dict(w)), True)[1],
                         set_burn_fn=lambda: True, out=io.StringIO())
             assert a.once()[-1].verdict == ACCEPT and wrote2[-1] == {OWNER: 1.0}
+
+
+def test_round_10s_first_name_still_audits():
+    """Round 10 was published as `owner_allocation`, with a long statement and the owner coldkey.
+    The trail is append-only, so renaming the mode must not turn it into a failed scored round."""
+    from eval.auditor import ACCEPT, Auditor, AuditorConfig
+    from eval.burn_round import is_allocation, is_emission_record
+
+    def legacy(raw):
+        em = raw["manifest"]["emission"]
+        em.update(mode="owner_allocation", owner_coldkey=OWNER_CK,
+                  statement="100% of this round's weight goes to uid 13, a hotkey held by the subnet "
+                            "owner. This is an owner allocation: not a competition result and not a burn.")
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        rec, rep, pub = _allocate_on(dd, root, chain, sig)
+        raw = json.loads(LocalSink(root).get(pub.load_index()["rounds"][-1]["name"]).decode())
+        legacy(raw)
+        r2 = record_from_blob(json.dumps(raw).encode())
+        assert is_allocation(r2) and is_emission_record(r2)
+        r2.signature = r2.signer = r2.sig_scheme = ""
+        r2.sign(sig)
+        p = Path(dd) / "legacy.json"
+        p.write_text(json.dumps(asdict(r2)))
+        a = audit(str(p))
+        assert not a.failed and a.exit_code == 0, [(c.name, c.detail) for c in a.failed]
