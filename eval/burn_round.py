@@ -20,6 +20,15 @@ reason.
 
 The target defaults to the signing validator's own hotkey (uid 0 on netuid 40 — the subnet
 owner's uid, which is where Bittensor convention sends a burn). `--to <ss58>` overrides it.
+
+OWNER ALLOCATION IS NOT A BURN, AND THE RECORD SAYS SO. Incentive written to the owner's own uid is
+recycled; incentive written to another hotkey the owner holds is COLLECTED. Both are the owner's
+call, and only one of them may be called a burn — a "burn" that pays a key the owner controls is a
+self-vote wearing the word, and the chain makes it findable (coldkey clustering does the rest). So
+the second mode is its own record shape: it names the target, the target's coldkey, and states in
+the signed body that the target is held by the subnet owner, with a reason.
+
+    python -m eval.burn_round --allocate-to <ss58> --reason "treasury for the next mechanism" --dry-run
 """
 from __future__ import annotations
 
@@ -29,6 +38,9 @@ import sys
 import time
 
 BURN_MODE = "burn"
+ALLOCATION_MODE = "owner_allocation"
+EMISSION_MODES = (BURN_MODE, ALLOCATION_MODE)
+HELD_BY_OWNER = "subnet owner"
 
 
 def emission_of(rec) -> dict:
@@ -39,6 +51,16 @@ def emission_of(rec) -> dict:
 
 def is_burn(rec) -> bool:
     return emission_of(rec).get("mode") == BURN_MODE
+
+
+def is_allocation(rec) -> bool:
+    return emission_of(rec).get("mode") == ALLOCATION_MODE
+
+
+def is_emission_record(rec) -> bool:
+    """A record that declares where emission goes and scores nothing: a burn or an allocation.
+    Neither moves a crown; the lineage, the crowns mirror and the status page skip both alike."""
+    return emission_of(rec).get("mode") in EMISSION_MODES
 
 
 def build_burn_record(*, round_no: int, prev_anchor: str, to_hotkey: str, to_uid: int,
@@ -63,8 +85,29 @@ def build_burn_record(*, round_no: int, prev_anchor: str, to_hotkey: str, to_uid
         started_at=now, published_at=now)
 
 
+def build_allocation_record(*, round_no: int, prev_anchor: str, to_hotkey: str, to_uid: int,
+                            to_coldkey: str, owner_coldkey: str, reason: str, parent_key: str,
+                            round_nonce: str, declared_at: float | None = None):
+    """An owner allocation: the whole vector to one hotkey the subnet owner holds, declared as
+    exactly that. `to_coldkey` and `owner_coldkey` are both recorded so a reader can see the payee's
+    coldkey is not the subnet-owner coldkey and still know who holds it — the record says so."""
+    if not str(to_coldkey or "").strip():
+        raise ValueError("an owner allocation must record the target's coldkey")
+    rec = build_burn_record(round_no=round_no, prev_anchor=prev_anchor, to_hotkey=to_hotkey,
+                            to_uid=to_uid, reason=reason, parent_key=parent_key,
+                            round_nonce=round_nonce, declared_at=declared_at)
+    rec.manifest["emission"].update({
+        "mode": ALLOCATION_MODE, "to_coldkey": to_coldkey, "owner_coldkey": owner_coldkey,
+        "held_by": HELD_BY_OWNER,
+        "statement": (f"100% of this round's weight goes to uid {int(to_uid)}, a hotkey held by the "
+                      f"subnet owner. This is an owner allocation: not a competition result and not "
+                      f"a burn."),
+    })
+    return rec
+
+
 def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = False,
-        out=sys.stdout) -> int:
+        allocate_to: str = "", out=sys.stdout) -> int:
     from .chain_bittensor import BittensorChainIO
     from .publish import HFSink, LocalSink, RecordPublisher, publish_and_gate
     from .run_orchestrated import Config
@@ -85,16 +128,41 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
     idx = publisher.load_index()
     round_no = len(idx.get("rounds", [])) + 1
     prev = publisher.head_anchor()
-    to_hotkey = (to or chain.me).strip()
+    if allocate_to and to:
+        w("  --to is a burn target and --allocate-to is an allocation; pick one\n")
+        return 2
+    if to and to.strip() != chain.me:
+        w("  a burn goes to this validator's own hotkey — auditors reject a burn paying anyone else."
+          " To pay another hotkey the owner holds, use --allocate-to\n")
+        return 2
+    to_hotkey = (allocate_to or to or chain.me).strip()
     to_uid = chain.uid_of(to_hotkey)
     if to_uid is None:
-        w(f"  {to_hotkey} is not registered on netuid {cfg.netuid}; a burn to it pays nobody\n")
+        w(f"  {to_hotkey} is not registered on netuid {cfg.netuid}; a record paying it pays nobody\n")
         return 2
-    rec = build_burn_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
-                            to_uid=to_uid, reason=reason, parent_key=cfg.parent_key,
-                            round_nonce=chain.block_hash(chain.current_block()))
-    w(f"  burn record: round {round_no}, 100% -> uid {to_uid} {to_hotkey[:12]}…, "
-      f"prev anchor {(prev or '(none)')[:16]}\n  reason: {reason.strip()}\n")
+    nonce = chain.block_hash(chain.current_block())
+    if allocate_to:
+        if to_hotkey == chain.me:
+            w("  allocating to this validator's own hotkey is a burn — use --to (or nothing)\n")
+            return 2
+        from .chain_bittensor import _item
+        owner_ck = str(getattr(chain.st().query(_item("SubtensorModule", "SubnetOwner"),
+                                                [cfg.netuid]), "value", "") or "")
+        rec = build_allocation_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
+                                      to_uid=to_uid, to_coldkey=chain._coldkey_of(to_uid),
+                                      owner_coldkey=owner_ck, reason=reason,
+                                      parent_key=cfg.parent_key, round_nonce=nonce)
+        kind = "owner allocation"
+    else:
+        rec = build_burn_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
+                                to_uid=to_uid, reason=reason, parent_key=cfg.parent_key,
+                                round_nonce=nonce)
+        kind = "burn record"
+    em = rec.manifest["emission"]
+    w(f"  {kind}: round {round_no}, 100% -> uid {to_uid} {to_hotkey[:12]}…, "
+      f"prev anchor {(prev or '(none)')[:16]}\n  reason: {reason.strip()}\n"
+      + (f"  statement: {em['statement']}\n  payee coldkey {em['to_coldkey']} · subnet owner "
+         f"coldkey {em['owner_coldkey']}\n" if allocate_to else ""))
     if dry_run:
         w(f"  --dry-run: digest {rec.sha256()[:16]}…; nothing signed, published or anchored\n")
         return 0
@@ -108,7 +176,7 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
     w(f"  published : {rep.published.uri if rep.published else None}\n"
       f"  anchored  : {rep.anchor_verified}   reasons={rep.reasons or '-'}\n")
     if not rep.ok:
-        w("  WITHHELD — the burn did not verify on chain, so the previous vector stands\n")
+        w(f"  WITHHELD — the {kind} did not verify on chain, so the previous vector stands\n")
         return 1
     if set_weights:
         ok = chain.set_weights(rec.weights)
@@ -123,12 +191,16 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--reason", required=True, help="why emission is burned; published in the record")
-    ap.add_argument("--to", default="", help="target hotkey ss58 (default: this validator's own)")
+    ap.add_argument("--to", default="", help="burn target hotkey ss58 (default: this validator's own)")
+    ap.add_argument("--allocate-to", default="", metavar="SS58",
+                    help="owner allocation instead of a burn: 100%% to this owner-held hotkey, "
+                         "declared as such in the record")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--set-weights", action="store_true",
                     help="also write the burn vector from this validator now")
     a = ap.parse_args(argv)
-    return run(a.reason, to=a.to, dry_run=a.dry_run, set_weights=a.set_weights)
+    return run(a.reason, to=a.to, dry_run=a.dry_run, set_weights=a.set_weights,
+               allocate_to=a.allocate_to)
 
 
 if __name__ == "__main__":

@@ -315,7 +315,7 @@ def parse_artifact_uri(uri: str) -> tuple[str, str]:
 
 def latest_record() -> tuple[dict, str]:
     """The newest signed record on the trail, and its URL."""
-    from .burn_round import is_burn
+    from .burn_round import is_emission_record
     index = _get(f"{TRAIL}/index.json")
     rounds = sorted(index.get("rounds", []), key=lambda r: r.get("round", 0))
     if not rounds:
@@ -324,9 +324,9 @@ def latest_record() -> tuple[dict, str]:
     # record says they are, and they keep their titles while a burn stands.
     for head in reversed(rounds):
         rec = _get(f"{TRAIL}/{head['name']}")
-        if not is_burn(rec):
+        if not is_emission_record(rec):
             return rec, f"{TRAIL}/{head['name']}"
-    raise SystemExit("the trail holds only burn records — no crowns to mirror")
+    raise SystemExit("the trail holds only burn/allocation records — no crowns to mirror")
 
 
 def current_kings(record: dict) -> dict:
