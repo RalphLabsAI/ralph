@@ -129,3 +129,152 @@ def test_a_burn_that_measures_or_pays_anyone_else_is_refused():
                               parent_key="qwen3-8b", round_nonce="0x0")
         # and the scored records before it are not burns
         assert not any(is_burn(r) for r in _records(root)[:-1])
+
+
+# ---------------------------------------------------------------- owner allocation
+
+ALLOC = "5G8iypbYKr8GL1CfWaoZe6Sk5tHXi8kh4WaacBpGeqN6NoFi"
+ALLOC_CK = "5GC9V7pLdpnurDCTLXiYwcTQVYrjQaFUUAfLNc3QfmqNa5NU"
+OWNER_CK = "5HeKCDfdTyk5gttniUXWVGvf6xSpbJJG86thJcZnqNZjThoU"
+
+
+def _allocate_on(dd, root, chain, sig, reason="treasury for the next mechanism"):
+    from eval.burn_round import build_allocation_record
+    pub = RecordPublisher(LocalSink(root), window=8, state_path=str(Path(dd) / "hwm-alloc.json"))
+    n = len(pub.load_index()["rounds"]) + 1
+    rec = build_allocation_record(round_no=n, prev_anchor=pub.head_anchor(), to_hotkey=ALLOC,
+                                  to_uid=13, to_coldkey=ALLOC_CK, owner_coldkey=OWNER_CK,
+                                  reason=reason, parent_key="qwen3-8b", round_nonce="0xalloc",
+                                  declared_at=1_800_000_000.0)
+    rec.sign(sig)
+    rep = publish_and_gate(pub, rec, anchor_fn=chain.publish_record,
+                           head_anchor_fn=chain.head_anchor)
+    return rec, rep, pub
+
+
+def test_an_owner_allocation_is_declared_as_one_and_reproduces():
+    from eval.burn_round import is_allocation, is_emission_record
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        rec, rep, pub = _allocate_on(dd, root, chain, sig)
+        assert rep.ok and rep.anchor_verified, rep.reasons
+        em = emission_of(rec)
+        assert is_allocation(rec) and is_emission_record(rec) and not is_burn(rec)
+        assert em["held_by"] == "subnet owner" and em["to_coldkey"] == ALLOC_CK
+        assert em["owner_coldkey"] == OWNER_CK
+        assert "not a competition result and not a burn" in em["statement"]
+        assert rec.weights == {ALLOC: 1.0} and not rec.events and not rec.submissions
+
+        a = audit(str(Path(root) / pub.load_index()["rounds"][-1]["name"]))
+        assert not a.failed, [(c.name, c.detail) for c in a.failed]
+        assert a.exit_code == 0
+        assert any(c.name == "weights are the declared allocation, exactly" and c.status == "PASS"
+                   for c in a.checks)
+
+
+def test_a_follower_pays_the_allocation_and_says_what_it_is():
+    from eval.auditor import ACCEPT, Auditor, AuditorConfig
+    from eval.lineage import replay, replay_contenders
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        before = _records(root)
+        _allocate_on(dd, root, chain, sig)
+        after = _records(root)
+        assert replay(after) == replay(before) and replay_contenders(after) == replay_contenders(before)
+
+        wrote, out = [], io.StringIO()
+        cfg = AuditorConfig(expected_signer=sig.public_id(), require=("L0", "L1"),
+                            pool_from_trail=False, set_weights=True,
+                            work_dir=str(Path(dd) / "follower"))
+        a = Auditor(cfg, sink=LocalSink(root), signer=Ed25519Signer(seed=b"a" * 32),
+                    head_anchor_fn=lambda: chain.head_anchor(),
+                    set_weights_fn=lambda w: (wrote.append(dict(w)), True)[1],
+                    set_burn_fn=lambda: True, out=out)
+        v = a.once()[-1]
+        assert v.verdict == ACCEPT, (v.verdict, v.failed, v.note)
+        assert wrote[-1] == {ALLOC: 1.0}
+        assert "OWNER ALLOCATION" in v.note and "uid 13" in v.note and "not a burn" in v.note
+        assert "OWNER ALLOCATION" in out.getvalue(), "the operator's log must say what it is paying"
+
+
+def test_an_allocation_that_hides_whose_it_is_is_refused():
+    from eval.burn_round import build_allocation_record
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        rec, rep, pub = _allocate_on(dd, root, chain, sig)
+        name = pub.load_index()["rounds"][-1]["name"]
+
+        def rigged(mutate):
+            raw = json.loads(LocalSink(root).get(name).decode())
+            mutate(raw)
+            r2 = record_from_blob(json.dumps(raw).encode())
+            r2.signature = r2.signer = r2.sig_scheme = ""
+            r2.sign(sig)
+            p = Path(dd) / "rigged.json"
+            p.write_text(json.dumps(asdict(r2)))
+            return audit(str(p))
+
+        # the disclosure stripped out: no "held by the subnet owner"
+        a = rigged(lambda r: r["manifest"]["emission"].pop("held_by"))
+        assert any(c.name == "allocation target declared" for c in a.failed)
+        # the payee's coldkey stripped out
+        a = rigged(lambda r: r["manifest"]["emission"].pop("to_coldkey"))
+        assert any(c.name == "allocation target declared" for c in a.failed)
+        # a second payee beside the declared one
+        a = rigged(lambda r: r.__setitem__("weights", {ALLOC: 0.5, OWNER: 0.5}))
+        assert any(c.name == "weights are the declared allocation, exactly" for c in a.failed)
+        # relabelled as a burn: the record alone reproduces (the label is the claim) — the
+        # follower test below is where a "burn" paying someone else is caught
+        a = rigged(lambda r: r["manifest"]["emission"].__setitem__("mode", "burn"))
+        assert not a.failed
+        with pytest.raises(ValueError):
+            build_allocation_record(round_no=9, prev_anchor="", to_hotkey=ALLOC, to_uid=13,
+                                    to_coldkey="", owner_coldkey=OWNER_CK, reason="x",
+                                    parent_key="qwen3-8b", round_nonce="0x0")
+
+
+def test_a_burn_that_pays_someone_else_is_refused_by_the_follower():
+    """A burn record naming a hotkey other than the scoring validator's reproduces on its own —
+    the label is only a claim. The follower knows the anchor hotkey from outside the trail and
+    refuses: that is a payment labelled as a burn, and it is not paid."""
+    from eval.auditor import ACCEPT, REJECT, Auditor, AuditorConfig
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        pub = RecordPublisher(LocalSink(root), window=8, state_path=str(Path(dd) / "hwm-x.json"))
+        rec = build_burn_record(round_no=len(pub.load_index()["rounds"]) + 1,
+                                prev_anchor=pub.head_anchor(), to_hotkey=ALLOC, to_uid=13,
+                                reason="mislabelled", parent_key="qwen3-8b", round_nonce="0x",
+                                declared_at=1_800_000_000.0)
+        rec.sign(sig)
+        assert publish_and_gate(pub, rec, anchor_fn=chain.publish_record,
+                                head_anchor_fn=chain.head_anchor).ok
+
+        def follower(work, anchor_hotkey):
+            wrote = []
+            cfg = AuditorConfig(expected_signer=sig.public_id(), validator_hotkey=anchor_hotkey,
+                                require=("L0", "L1"), pool_from_trail=False, set_weights=True,
+                                work_dir=str(Path(dd) / work))
+            a = Auditor(cfg, sink=LocalSink(root), signer=Ed25519Signer(seed=b"a" * 32),
+                        head_anchor_fn=lambda: chain.head_anchor(),
+                        set_weights_fn=lambda w: (wrote.append(dict(w)), True)[1],
+                        set_burn_fn=lambda: True, out=io.StringIO())
+            return a.once()[-1], wrote
+
+        v, wrote = follower("pinned", OWNER)
+        assert v.verdict == REJECT
+        assert any("labelled as a burn" in str(f) for f in v.failed), v.failed
+        assert {ALLOC: 1.0} not in wrote, "paid a mislabelled burn"
+
+        # and a real burn to the anchor hotkey is still followed under the same pin
+        with tempfile.TemporaryDirectory() as d2:
+            root2, chain2, sig2, _ = _auditor_fixture(d2)
+            _burn_on(d2, root2, chain2, sig2)
+            wrote2 = []
+            cfg = AuditorConfig(expected_signer=sig2.public_id(), validator_hotkey=OWNER,
+                                require=("L0", "L1"), pool_from_trail=False, set_weights=True,
+                                work_dir=str(Path(d2) / "ok"))
+            a = Auditor(cfg, sink=LocalSink(root2), signer=Ed25519Signer(seed=b"a" * 32),
+                        head_anchor_fn=lambda: chain2.head_anchor(),
+                        set_weights_fn=lambda w: (wrote2.append(dict(w)), True)[1],
+                        set_burn_fn=lambda: True, out=io.StringIO())
+            assert a.once()[-1].verdict == ACCEPT and wrote2[-1] == {OWNER: 1.0}

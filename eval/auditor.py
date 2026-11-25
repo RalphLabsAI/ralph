@@ -486,6 +486,20 @@ class Auditor:
                          observer_name=obs_name, make_runner=self._make_runner(),
                          max_l3_items=self.cfg.l3_items)
 
+        # A BURN GOES TO THE SCORING VALIDATOR'S OWN HOTKEY, OR IT IS NOT A BURN. The record alone
+        # cannot tell: "burn" is a label, and a burn record naming any other hotkey would reproduce
+        # cleanly while paying that hotkey. The anchor hotkey is the one identity this auditor has
+        # pinned from outside the trail, so it is the check. Paying another hotkey has its own
+        # declared shape (an owner allocation), which says whose it is.
+        from .burn_round import emission_of as _em, is_burn as _is_burn
+        if _is_burn(rec) and self.cfg.validator_hotkey:
+            to = _em(rec).get("to")
+            a.ok("L0", "burn goes to the scoring validator's own hotkey",
+                 to == self.cfg.validator_hotkey,
+                 fail=f"burn record pays {str(to)[:12]}… but the scoring validator is "
+                      f"{self.cfg.validator_hotkey[:12]}… — that is a payment labelled as a burn",
+                 info=f"100% -> {str(to)[:12]}… (the anchor hotkey)")
+
         # WHOSE RECORD IS THIS. rerun proves the signature is valid over the body; it has no idea
         # whose signature it ought to be. Following a sink without pinning the signer means
         # verifying whatever the repo holder signs, which is not an audit of the validator.
@@ -528,6 +542,15 @@ class Auditor:
         else:
             v.verdict = ACCEPT
         v.weights = dict(getattr(rec, "weights", {}) or {})
+        from .burn_round import emission_of, is_allocation, is_burn
+        if v.verdict == ACCEPT and (is_allocation(rec) or is_burn(rec)):
+            # NOT A CROWN, AND THE OPERATOR READING THIS LOG SHOULD NOT HAVE TO OPEN THE RECORD TO
+            # FIND OUT. An allocation pays a hotkey the subnet owner holds; a burn recycles.
+            em = emission_of(rec)
+            v.note = ((f"OWNER ALLOCATION: 100% -> uid {em.get('to_uid')} {str(em.get('to'))[:12]}… "
+                       f"(held by the {em.get('held_by')}) — not a competition result, not a burn")
+                      if is_allocation(rec) else
+                      f"BURN: 100% -> uid {em.get('to_uid')} — no competition this round")
         return self._finish(v)
 
     def _finish(self, v: Verdict) -> Verdict:

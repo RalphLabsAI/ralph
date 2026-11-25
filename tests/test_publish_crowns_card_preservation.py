@@ -115,7 +115,7 @@ def test_a_crown_change_voids_the_license_and_flips_the_badge_to_pending():
     assert new["round"] == 8 and new["source_repo"] == "b/n"
 
     card = pc.readme({"sub2": new}, "u", "org/crowns", record={"round": 8}, existing_card=LIVE)
-    assert "license: other" in card and "license_name: Artifact license pending" in card
+    assert "license: other" in card and "license_name: artifact-license-pending" in card
     assert "license: apache-2.0" not in card
     assert "**pending review**: crowned in Round 8" in card
     assert "Each exact GGUF listed above is Apache-2.0." in card, "the maintainer's prose is theirs"
@@ -126,8 +126,8 @@ def test_a_crown_change_voids_the_license_and_flips_the_badge_to_pending():
     assert kept["round"] == 7 and kept["retention"] == 0.282457
     assert pc.licensed(kept) == "apache-2.0"
     assert pc.repo_license({"sub2": kept}) == ("apache-2.0", "")
-    assert pc.repo_license({"sub2": kept, "sub4": _entry("x")}) == ("other", "Artifact license pending")
-    assert pc.repo_license({}) == ("other", "Artifact license pending")
+    assert pc.repo_license({"sub2": kept, "sub4": _entry("x")}) == ("other", "artifact-license-pending")
+    assert pc.repo_license({}) == ("other", "artifact-license-pending")
 
 
 def test_front_matter_is_merged_not_replaced():

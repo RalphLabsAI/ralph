@@ -225,7 +225,9 @@ def repo_license(manifest: dict) -> tuple[str, str]:
     ids = {licensed(e) for e in rows}
     if rows and len(ids) == 1 and next(iter(ids)):
         return next(iter(ids)).lower(), ""
-    return "other", "Artifact license pending"
+    # A SLUG, NOT A PHRASE. The Hub validates `license_name` against /^[a-z0-9-.]+$/ and rejects
+    # the whole commit otherwise — which is how a dethrone failed to mirror its new crown.
+    return "other", "artifact-license-pending"
 
 
 # ---------------------------------------------------------------- artifact metadata
@@ -313,7 +315,7 @@ def parse_artifact_uri(uri: str) -> tuple[str, str]:
 
 def latest_record() -> tuple[dict, str]:
     """The newest signed record on the trail, and its URL."""
-    from .burn_round import is_burn
+    from .burn_round import is_emission_record
     index = _get(f"{TRAIL}/index.json")
     rounds = sorted(index.get("rounds", []), key=lambda r: r.get("round", 0))
     if not rounds:
@@ -322,9 +324,9 @@ def latest_record() -> tuple[dict, str]:
     # record says they are, and they keep their titles while a burn stands.
     for head in reversed(rounds):
         rec = _get(f"{TRAIL}/{head['name']}")
-        if not is_burn(rec):
+        if not is_emission_record(rec):
             return rec, f"{TRAIL}/{head['name']}"
-    raise SystemExit("the trail holds only burn records — no crowns to mirror")
+    raise SystemExit("the trail holds only burn/allocation records — no crowns to mirror")
 
 
 def current_kings(record: dict) -> dict:
