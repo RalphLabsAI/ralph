@@ -146,8 +146,13 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
             w("  allocating to this validator's own hotkey is a burn — use --to (or nothing)\n")
             return 2
         from .chain_bittensor import _item
-        owner_ck = str(getattr(chain.st().query(_item("SubtensorModule", "SubnetOwner"),
-                                                [cfg.netuid]), "value", "") or "")
+        # 11.x hands back a plain str for this item; fall back to the object, never to a blank
+        _v = chain.st().query(_item("SubtensorModule", "SubnetOwner"), [cfg.netuid])
+        owner_ck = str(getattr(_v, "value", _v) or "")
+        if not owner_ck:
+            w("  could not read the subnet-owner coldkey; refusing to publish an allocation "
+              "that cannot say whose subnet it is\n")
+            return 2
         rec = build_allocation_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
                                       to_uid=to_uid, to_coldkey=chain._coldkey_of(to_uid),
                                       owner_coldkey=owner_ck, reason=reason,
