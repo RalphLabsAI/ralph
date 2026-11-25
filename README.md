@@ -452,22 +452,19 @@ nothing to re-derive and are optional skips, and `--set-weights` pays the vector
 kings keep their titles — the lineage replays events and a burn record has none — and go unpaid
 until the next scored record, which ends the burn for every follower at once.
 
-### Owner allocation
+### Reward allocation
 
-A burn recycles: weight written to the subnet owner's own hotkey is not paid to anyone. Weight
-written to *another* hotkey the owner holds is collected, so it is not a burn and the trail does not
-call it one. An **owner allocation** record has the burn record's shape — nothing scored, no crown
-events, 100% of the vector to one hotkey, a stated reason — and additionally records the payee's
-coldkey and states in the signed body that the subnet owner holds it:
+A burn recycles: weight on the subnet owner's own hotkey is paid to no one. Weight on *another*
+hotkey the owner holds is collected, so the trail does not call it a burn. A **reward allocation**
+record has the burn record's shape — nothing scored, no crown events, 100% of the vector to one
+hotkey, a stated reason — and records the payee's coldkey and `held_by: subnet owner`:
 
 ```bash
 python -m eval.burn_round --allocate-to <ss58> --reason "..." --dry-run
 ```
 
-An auditor reproduces it the same way, pays the vector it carries, and logs every pass that it is
-following an owner allocation rather than a competition result. A record labelled a burn whose
-target is not the scoring validator's own hotkey (`--anchor-hotkey`) is rejected and not paid —
-paying another hotkey has to be declared as what it is.
+Auditors reproduce and pay it like a burn. A record labelled a burn whose target is not the scoring
+validator's own hotkey (`--anchor-hotkey`) is rejected and not paid.
 
 ### Publishing your verdicts
 

@@ -21,14 +21,13 @@ reason.
 The target defaults to the signing validator's own hotkey (uid 0 on netuid 40 — the subnet
 owner's uid, which is where Bittensor convention sends a burn). `--to <ss58>` overrides it.
 
-OWNER ALLOCATION IS NOT A BURN, AND THE RECORD SAYS SO. Incentive written to the owner's own uid is
-recycled; incentive written to another hotkey the owner holds is COLLECTED. Both are the owner's
-call, and only one of them may be called a burn — a "burn" that pays a key the owner controls is a
-self-vote wearing the word, and the chain makes it findable (coldkey clustering does the rest). So
-the second mode is its own record shape: it names the target, the target's coldkey, and states in
-the signed body that the target is held by the subnet owner, with a reason.
+A REWARD ALLOCATION IS NOT A BURN, AND THE RECORD SAYS WHOSE IT IS. Incentive written to the
+owner's own uid is recycled; incentive written to another hotkey the owner holds is COLLECTED. Both
+are the owner's call, and only one of them may be called a burn — a "burn" that pays a key the owner
+controls is a self-vote wearing the word. So the second mode is its own record shape: it names the
+target, the target's coldkey, and `held_by: subnet owner` in the signed body, with a reason.
 
-    python -m eval.burn_round --allocate-to <ss58> --reason "treasury for the next mechanism" --dry-run
+    python -m eval.burn_round --allocate-to <ss58> --reason "..." --dry-run
 """
 from __future__ import annotations
 
@@ -38,8 +37,11 @@ import sys
 import time
 
 BURN_MODE = "burn"
-ALLOCATION_MODE = "owner_allocation"
-EMISSION_MODES = (BURN_MODE, ALLOCATION_MODE)
+ALLOCATION_MODE = "reward_allocation"
+# round 10 was published under the first name; the trail is append-only, so it stays readable
+LEGACY_ALLOCATION_MODES = ("owner_allocation",)
+ALLOCATION_MODES = (ALLOCATION_MODE,) + LEGACY_ALLOCATION_MODES
+EMISSION_MODES = (BURN_MODE,) + ALLOCATION_MODES
 HELD_BY_OWNER = "subnet owner"
 
 
@@ -54,7 +56,7 @@ def is_burn(rec) -> bool:
 
 
 def is_allocation(rec) -> bool:
-    return emission_of(rec).get("mode") == ALLOCATION_MODE
+    return emission_of(rec).get("mode") in ALLOCATION_MODES
 
 
 def is_emission_record(rec) -> bool:
@@ -86,23 +88,17 @@ def build_burn_record(*, round_no: int, prev_anchor: str, to_hotkey: str, to_uid
 
 
 def build_allocation_record(*, round_no: int, prev_anchor: str, to_hotkey: str, to_uid: int,
-                            to_coldkey: str, owner_coldkey: str, reason: str, parent_key: str,
-                            round_nonce: str, declared_at: float | None = None):
-    """An owner allocation: the whole vector to one hotkey the subnet owner holds, declared as
-    exactly that. `to_coldkey` and `owner_coldkey` are both recorded so a reader can see the payee's
-    coldkey is not the subnet-owner coldkey and still know who holds it — the record says so."""
+                            to_coldkey: str, reason: str, parent_key: str, round_nonce: str,
+                            declared_at: float | None = None):
+    """A reward allocation: the whole vector to one hotkey the subnet owner holds. The record
+    carries the target's coldkey and `held_by` — the one fact that separates it from a crown."""
     if not str(to_coldkey or "").strip():
-        raise ValueError("an owner allocation must record the target's coldkey")
+        raise ValueError("a reward allocation must record the target's coldkey")
     rec = build_burn_record(round_no=round_no, prev_anchor=prev_anchor, to_hotkey=to_hotkey,
                             to_uid=to_uid, reason=reason, parent_key=parent_key,
                             round_nonce=round_nonce, declared_at=declared_at)
-    rec.manifest["emission"].update({
-        "mode": ALLOCATION_MODE, "to_coldkey": to_coldkey, "owner_coldkey": owner_coldkey,
-        "held_by": HELD_BY_OWNER,
-        "statement": (f"100% of this round's weight goes to uid {int(to_uid)}, a hotkey held by the "
-                      f"subnet owner. This is an owner allocation: not a competition result and not "
-                      f"a burn."),
-    })
+    rec.manifest["emission"].update({"mode": ALLOCATION_MODE, "to_coldkey": to_coldkey,
+                                     "held_by": HELD_BY_OWNER})
     return rec
 
 
@@ -145,19 +141,10 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
         if to_hotkey == chain.me:
             w("  allocating to this validator's own hotkey is a burn — use --to (or nothing)\n")
             return 2
-        from .chain_bittensor import _item
-        # 11.x hands back a plain str for this item; fall back to the object, never to a blank
-        _v = chain.st().query(_item("SubtensorModule", "SubnetOwner"), [cfg.netuid])
-        owner_ck = str(getattr(_v, "value", _v) or "")
-        if not owner_ck:
-            w("  could not read the subnet-owner coldkey; refusing to publish an allocation "
-              "that cannot say whose subnet it is\n")
-            return 2
         rec = build_allocation_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
                                       to_uid=to_uid, to_coldkey=chain._coldkey_of(to_uid),
-                                      owner_coldkey=owner_ck, reason=reason,
-                                      parent_key=cfg.parent_key, round_nonce=nonce)
-        kind = "owner allocation"
+                                      reason=reason, parent_key=cfg.parent_key, round_nonce=nonce)
+        kind = "reward allocation"
     else:
         rec = build_burn_record(round_no=round_no, prev_anchor=prev, to_hotkey=to_hotkey,
                                 to_uid=to_uid, reason=reason, parent_key=cfg.parent_key,
@@ -166,8 +153,7 @@ def run(reason: str, to: str = "", dry_run: bool = False, set_weights: bool = Fa
     em = rec.manifest["emission"]
     w(f"  {kind}: round {round_no}, 100% -> uid {to_uid} {to_hotkey[:12]}…, "
       f"prev anchor {(prev or '(none)')[:16]}\n  reason: {reason.strip()}\n"
-      + (f"  statement: {em['statement']}\n  payee coldkey {em['to_coldkey']} · subnet owner "
-         f"coldkey {em['owner_coldkey']}\n" if allocate_to else ""))
+      + (f"  held by {em['held_by']} · payee coldkey {em['to_coldkey']}\n" if allocate_to else ""))
     if dry_run:
         w(f"  --dry-run: digest {rec.sha256()[:16]}…; nothing signed, published or anchored\n")
         return 0
@@ -198,8 +184,8 @@ def main(argv=None) -> int:
     ap.add_argument("--reason", required=True, help="why emission is burned; published in the record")
     ap.add_argument("--to", default="", help="burn target hotkey ss58 (default: this validator's own)")
     ap.add_argument("--allocate-to", default="", metavar="SS58",
-                    help="owner allocation instead of a burn: 100%% to this owner-held hotkey, "
-                         "declared as such in the record")
+                    help="reward allocation instead of a burn: 100%% to this owner-held "
+                         "hotkey (recorded with held_by: subnet owner)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--set-weights", action="store_true",
                     help="also write the burn vector from this validator now")
